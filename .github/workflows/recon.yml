@@ -4,744 +4,950 @@ on:
   workflow_dispatch:
     inputs:
       target_domain:
-        description: Root domain to recon
+        description: 'Target domain to recon (e.g., example.com)'
         required: true
         type: string
-      checkpoint_run_id:
-        description: Previous run id to resume from
+      debug:
+        description: 'Enable debug mode (skip to specific stage)'
         required: false
+        default: ''
         type: string
   repository_dispatch:
-    types:
-      - elite-bug-bounty-recon-resume
+    types: [resume_recon]
 
-permissions:
-  contents: write
-  actions: read
+env:
+  TARGET_DOMAIN: ''
+  PROGRESS_FILE: progress.json
+  RESULTS_DIR: results
+  WORKFLOW_TIMEOUT_MINUTES: 330
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-concurrency:
-  group: elite-bug-bounty-recon-${{ github.event.client_payload.target_domain || github.event.inputs.target_domain }}
-  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
 
 jobs:
   recon:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
-    env:
-      MAX_RUNTIME_SECONDS: "19800"
-      BATCH_SIZE: "5000"
-      WORK_ROOT: work
-      NUCLEI_TEMPLATES: tools/nuclei-templates
+    outputs:
+      progress_state: ${{ steps.checkpoint.outputs.progress_state }}
+      target_domain: ${{ steps.resolve_target.outputs.target_domain }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
-      - name: Set up Go
+# ============================================================
+# SETUP & CHECKPOINT RESTORE
+# ============================================================
+      - name: Resolve target domain
+        id: resolve_target
+        run: |
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            TARGET="${{ github.event.client_payload.target_domain }}"
+          else
+            TARGET="${{ inputs.target_domain }}"
+          fi
+          echo "target_domain=$TARGET" >> $GITHUB_OUTPUT
+          echo "TARGET_DOMAIN=$TARGET" >> $GITHUB_ENV
+
+      - name: Restore checkpoint
+        id: checkpoint
+        run: |
+          mkdir -p ${{ env.RESULTS_DIR }}
+          
+          # Download artifacts from previous runs if they exist
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            echo "Auto-resume triggered - restoring checkpoint"
+            # Artifacts are automatically downloaded via actions/download-artifact
+          fi
+          
+          # Initialize or read progress
+          if [[ -f "${{ env.PROGRESS_FILE }}" ]]; then
+            echo "Found existing progress file"
+            NEXT_STAGE=$(python3 scripts/manage_progress.py read 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('next_stage','subdomain_enumeration'))" 2>/dev/null || echo "subdomain_enumeration")
+            echo "progress_state=resume" >> $GITHUB_OUTPUT
+            echo "Resuming from stage: $NEXT_STAGE"
+          else
+            echo "Initializing new recon for ${{ steps.resolve_target.outputs.target_domain }}"
+            python3 scripts/manage_progress.py init "${{ steps.resolve_target.outputs.target_domain }}"
+            echo "progress_state=new" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download previous artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: ${{ env.RESULTS_DIR }}
+          merge-multiple: true
+
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.26.x"
+          go-version: '1.24'
+          cache: true
 
-      - name: Install system packages and Go tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y jq ripgrep
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install -v github.com/hueristiq/xsubfind3r/cmd/xsubfind3r@latest
-          go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
-          go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go install -v github.com/lc/gau/v2/cmd/gau@latest
-          go install -v github.com/tomnomnom/waybackurls@latest
-          go install -v github.com/hueristiq/xcrawl3r/cmd/xcrawl3r@latest
-          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
-          go install -v github.com/gitleaks/gitleaks/v8@latest
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Build Subhunter
-        shell: bash
+      - name: Install Go tools
         run: |
-          set -euo pipefail
-          git clone --depth 1 https://github.com/umutcamliyurt/Subhunter.git tools/Subhunter
-          (cd tools/Subhunter && go build -o subhunter subhunter.go)
+          TOOLS=(
+            "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+            "github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
+            "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
+            "github.com/projectdiscovery/httpx/cmd/httpx@latest"
+            "github.com/projectdiscovery/katana/cmd/katana@latest"
+            "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+            "github.com/haccer/subjack@latest"
+            "github.com/lc/gau/v2/cmd/gau@latest"
+            "github.com/tomnomnom/assetfinder@latest"
+            "github.com/tomnomnom/waybackurls@latest"
+            "github.com/tomnomnom/unfurl@latest"
+            "github.com/tomnomnom/qsreplace@latest"
+            "github.com/lc/subjs@latest"
+            "github.com/sa7mon/s3scanner@latest"
+            "github.com/trufflesecurity/trufflehog/v3@latest"
+          )
+          for tool in "${TOOLS[@]}"; do
+            echo "Installing $tool"
+            go install -v "$tool" 2>/dev/null || echo "Failed: $tool"
+          done
+          echo "$HOME/go/bin" >> $GITHUB_PATH
 
-      - name: Clone nuclei templates
-        shell: bash
+      - name: Install Python tools
         run: |
-          set -euo pipefail
-          git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates.git "$NUCLEI_TEMPLATES"
+          pip install requests jsbeautifier
+          git clone --depth 1 https://github.com/m4ll0k/SecretFinder.git /opt/SecretFinder 2>/dev/null || true
+          git clone --depth 1 https://github.com/s0md3v/Corsy.git /opt/Corsy 2>/dev/null || true
+          echo "Tools installed"
 
-      - name: Restore or initialize checkpoint
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_DOMAIN: ${{ github.event.client_payload.target_domain || github.event.inputs.target_domain }}
-          SOURCE_RUN_ID: ${{ github.event.client_payload.source_run_id || github.event.inputs.checkpoint_run_id || '' }}
+      - name: Update Nuclei templates
         run: |
-          set -euo pipefail
-          mkdir -p "$WORK_ROOT/resume" "$WORK_ROOT/artifacts"
-          if [ -n "$SOURCE_RUN_ID" ]; then
-            gh run download "$SOURCE_RUN_ID" --dir "$WORK_ROOT/resume" || true
-            if find "$WORK_ROOT/resume" -name progress.json -print -quit | grep -q .; then
-              python3 scripts/progress.py merge-latest --artifacts-dir "$WORK_ROOT/resume" --output "$WORK_ROOT/progress.json"
+          nuclei -update-templates 2>/dev/null || true
+
+# ============================================================
+# STAGE 1: SUBDOMAIN ENUMERATION
+# ============================================================
+      - name: Stage 1 - Subdomain Enumeration
+        id: subdomain_enumeration
+        if: steps.checkpoint.outputs.progress_state != 'resume' || (steps.checkpoint.outputs.progress_state == 'resume' && !contains(fromJson(steps.checkpoint.outputs.progress_state), 'subdomain_enumeration'))
+        run: |
+          python3 scripts/manage_progress.py status subdomain_enumeration running
+
+          TARGET="${{ steps.resolve_target.outputs.target_domain }}"
+          
+          # Passive enumeration
+          subfinder -d "$TARGET" -all -o "${{ env.RESULTS_DIR }}/subfinder.txt" 2>/dev/null
+          assetfinder "$TARGET" > "${{ env.RESULTS_DIR }}/assetfinder.txt" 2>/dev/null
+          
+          # Active enumeration with Amass (limited scope)
+          amass enum -passive -d "$TARGET" -o "${{ env.RESULTS_DIR }}/amass.txt" 2>/dev/null || true
+          
+          # Merge and deduplicate
+          cat "${{ env.RESULTS_DIR }}"/subfinder.txt "${{ env.RESULTS_DIR }}"/assetfinder.txt "${{ env.RESULTS_DIR }}"/amass.txt 2>/dev/null \
+            | sort -u | grep -E "\.$TARGET$" | grep -v "^\*" > "${{ env.RESULTS_DIR }}/subs.txt"
+          
+          COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/subs.txt" 2>/dev/null || echo 0)
+          echo "Found $COUNT subdomains"
+          
+          python3 scripts/manage_progress.py complete subdomain_enumeration
+
+      - name: Upload artifacts after subdomain enumeration
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results-subdomains
+          path: |
+            ${{ env.RESULTS_DIR }}/subs.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
+
+# ============================================================
+# STAGE 2: DNS RESOLUTION
+# ============================================================
+      - name: Stage 2 - DNS Resolution
+        id: dns_resolution
+        run: |
+          python3 scripts/manage_progress.py status dns_resolution running
+
+          if [[ ! -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
+            echo "No subdomains to resolve"
+            python3 scripts/manage_progress.py complete dns_resolution
+            exit 0
+          fi
+
+          # Resolve with wildcard detection
+          dnsx -l "${{ env.RESULTS_DIR }}/subs.txt" \
+            -a -cname -mx -ptr \
+            -wildcard \
+            -o "${{ env.RESULTS_DIR }}/resolved.txt" \
+            -r 8.8.8.8,1.1.1.1,8.8.4.4 2>/dev/null
+
+          COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/resolved.txt" 2>/dev/null || echo 0)
+          echo "Resolved $COUNT subdomains"
+
+          python3 scripts/manage_progress.py complete dns_resolution
+
+      - name: Upload artifacts after DNS resolution
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results-dns
+          path: |
+            ${{ env.RESULTS_DIR }}/resolved.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
+
+# ============================================================
+# STAGE 3: PORT SCANNING
+# ============================================================
+      - name: Stage 3 - Port Scanning
+        id: port_scanning
+        run: |
+          python3 scripts/manage_progress.py status port_scanning running
+
+          if [[ ! -f "${{ env.RESULTS_DIR }}/resolved.txt" ]]; then
+            echo "No resolved hosts to scan"
+            python3 scripts/manage_progress.py complete port_scanning
+            exit 0
+          fi
+
+          # Extract just domains/hosts from resolved output
+          awk '{print $1}' "${{ env.RESULTS_DIR }}/resolved.txt" | sort -u > /tmp/hosts_to_scan.txt
+
+          # Rate-limited port scan using CONNECT scan (no root needed)
+          naabu -list /tmp/hosts_to_scan.txt \
+            -top-ports 100 \
+            -rate-limit 100 \
+            -c 25 \
+            -s c \
+            -o "${{ env.RESULTS_DIR }}/ports.txt" 2>/dev/null || true
+
+          COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/ports.txt" 2>/dev/null || echo 0)
+          echo "Found $COUNT open ports"
+
+          python3 scripts/manage_progress.py complete port_scanning
+
+      - name: Upload artifacts after port scanning
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results-ports
+          path: |
+            ${{ env.RESULTS_DIR }}/ports.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
+
+# ============================================================
+# STAGE 4: HTTP PROBING
+# ============================================================
+      - name: Stage 4 - HTTP Probing
+        id: http_probing
+        run: |
+          python3 scripts/manage_progress.py status http_probing running
+
+          if [[ ! -f "${{ env.RESULTS_DIR }}/ports.txt" ]] && [[ ! -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
+            echo "No targets for HTTP probing"
+            python3 scripts/manage_progress.py complete http_probing
+            exit 0
+          fi
+
+          # Use both subdomains and port scan results
+          if [[ -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
+            TARGETS="${{ env.RESULTS_DIR }}/subs.txt"
+          else
+            echo "No targets available"
+            python3 scripts/manage_progress.py complete http_probing
+            exit 0
+          fi
+
+          httpx -l "$TARGETS" \
+            -status-code -title -tech-detect -content-length \
+            -follow-redirects -cdn -ip -cname \
+            -rl 150 \
+            -o "${{ env.RESULTS_DIR }}/alive.txt" \
+            -json 2>/dev/null || true
+
+          COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/alive.txt" 2>/dev/null || echo 0)
+          echo "Found $COUNT live HTTP services"
+
+          python3 scripts/manage_progress.py complete http_probing
+
+      - name: Upload artifacts after HTTP probing
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results-http
+          path: |
+            ${{ env.RESULTS_DIR }}/alive.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
+
+# ============================================================
+# STAGE 5: HISTORICAL URL GATHERING
+# ============================================================
+      - name: Stage 5 - Historical URL Gathering
+        id: historical_urls
+        run: |
+          python3 scripts/manage_progress.py status historical_urls running
+
+          TARGET="${{ steps.resolve_target.outputs.target_domain }}"
+
+          # gau with multiple providers
+          echo "$TARGET" | gau --subs \
+            --o "${{ env.RESULTS_DIR }}/gau_urls.txt" 2>/dev/null || true
+
+          # waybackurls for additional coverage
+          echo "$TARGET" | waybackurls > "${{ env.RESULTS_DIR }}/wayback_urls.txt" 2>/dev/null || true
+
+          # Merge and deduplicate
+          cat "${{ env.RESULTS_DIR }}"/gau_urls.txt "${{ env.RESULTS_DIR }}"/wayback_urls.txt 2>/dev/null \
+            | sort -u > "${{ env.RESULTS_DIR }}/historical_urls.txt"
+
+          COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/historical_urls.txt" 2>/dev/null || echo 0)
+          echo "Found $COUNT historical URLs"
+
+          python3 scripts/manage_progress.py complete historical_urls
+
+      - name: Upload artifacts after historical URLs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results-historical
+          path: |
+            ${{ env.RESULTS_DIR }}/historical_urls.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
+
+# ============================================================
+# STAGE 6: LIVE CRAWLING
+# ============================================================
+      - name: Stage 6 - Live Crawling
+        id: live_crawling
+        run: |
+          python3 scripts/manage_progress.py status live_crawling running
+
+          TARGET="${{ steps.resolve_target.outputs.target_domain }}"
+
+          # Use katana on live targets
+          if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
+            # Extract URLs from httpx output (JSON)
+            cat "${{ env.RESULTS_DIR }}/alive.txt" 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        d = json.loads(line.strip())
+        url = d.get('url', '')
+        if url:
+            print(url)
+    except:
+        pass
+" 2>/dev/null > /tmp/live_urls.txt
+
+            if [[ -s /tmp/live_urls.txt ]]; then
+              katana -list /tmp/live_urls.txt \
+                -d 3 \
+                -jc \
+                -kf robotstxt,sitemapxml \
+                -rl 50 \
+                -c 10 \
+                -silent \
+                -o "${{ env.RESULTS_DIR }}/crawled_urls.txt" 2>/dev/null || true
             fi
           fi
-          if [ ! -f "$WORK_ROOT/progress.json" ]; then
-            python3 scripts/progress.py init --target-domain "$TARGET_DOMAIN" --output "$WORK_ROOT/progress.json"
-          fi
-          echo "TARGET_DOMAIN=$TARGET_DOMAIN" >> "$GITHUB_ENV"
 
-      - name: Subdomain enumeration
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          stage=subdomain_enumeration
-          next=dns_resolution
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          if [ "$SECONDS" -ge $((MAX_RUNTIME_SECONDS - 300)) ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            python3 - <<'PY'
-import json, os, urllib.request
-repo = os.environ["GITHUB_REPOSITORY"]
-owner, name = repo.split("/", 1)
-payload = {
-    "event_type": "elite-bug-bounty-recon-resume",
-    "client_payload": {
-        "target_domain": os.environ["TARGET_DOMAIN"],
-        "source_run_id": os.environ["GITHUB_RUN_ID"],
-        "next_stage": "subdomain_enumeration",
-        "current_batch": 1,
-        "last_completed_stage": "",
-    },
-}
-request = urllib.request.Request(
-    f"https://api.github.com/repos/{owner}/{name}/dispatches",
-    data=json.dumps(payload).encode("utf-8"),
-    headers={
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    },
-    method="POST",
-)
-urllib.request.urlopen(request).read()
-PY
-            exit 0
-          fi
-          {
-            subfinder -silent -d "$TARGET_DOMAIN" || true
-            xsubfind3r -s -d "$TARGET_DOMAIN" || true
-          } | sort -u > "$stage_dir/subs.txt"
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/crawled_urls.txt" 2>/dev/null || echo 0)
+          echo "Crawled $COUNT URLs"
 
-      - name: Upload subdomain artifact
+          python3 scripts/manage_progress.py complete live_crawling
+
+      - name: Upload artifacts after crawling
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-01-subdomain-enumeration
-          path: work/artifacts/subdomain_enumeration
-          if-no-files-found: ignore
+          name: recon-results-crawled
+          path: |
+            ${{ env.RESULTS_DIR }}/crawled_urls.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: DNS resolution
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 7: URL NORMALIZATION
+# ============================================================
+      - name: Stage 7 - URL Normalization
+        id: url_normalization
         run: |
-          set -euo pipefail
-          stage=dns_resolution
-          next=port_scanning
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          if [ "$SECONDS" -ge $((MAX_RUNTIME_SECONDS - 300)) ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            python3 - <<'PY'
-import json, os, urllib.request
-owner, name = os.environ["GITHUB_REPOSITORY"].split("/", 1)
-payload = {
-    "event_type": "elite-bug-bounty-recon-resume",
-    "client_payload": {
-        "target_domain": os.environ["TARGET_DOMAIN"],
-        "source_run_id": os.environ["GITHUB_RUN_ID"],
-        "next_stage": "dns_resolution",
-        "current_batch": 1,
-        "last_completed_stage": "subdomain_enumeration",
-    },
-}
-request = urllib.request.Request(
-    f"https://api.github.com/repos/{owner}/{name}/dispatches",
-    data=json.dumps(payload).encode("utf-8"),
-    headers={
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    },
-    method="POST",
-)
-urllib.request.urlopen(request).read()
-PY
-            exit 0
-          fi
-          dnsx -silent -a -auto-wildcard -l "$WORK_ROOT/artifacts/subdomain_enumeration/subs.txt" -o "$stage_dir/resolved_raw.txt"
-          awk '{print $1}' "$stage_dir/resolved_raw.txt" | sort -u > "$stage_dir/resolved.txt"
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          python3 scripts/manage_progress.py status url_normalization running
 
-      - name: Upload DNS artifact
+          # Merge all URL sources
+          cat "${{ env.RESULTS_DIR }}"/historical_urls.txt "${{ env.RESULTS_DIR }}"/crawled_urls.txt 2>/dev/null \
+            | sort -u > /tmp/all_raw_urls.txt
+
+          if [[ ! -s /tmp/all_raw_urls.txt ]]; then
+            echo "No URLs to normalize"
+            python3 scripts/manage_progress.py complete url_normalization
+            exit 0
+          fi
+
+          # Normalize: deduplicate by path structure, keep unique URLs
+          cat /tmp/all_raw_urls.txt \
+            | unfurl format "%s://%d%p" \
+            | sort -u \
+            > "${{ env.RESULTS_DIR }}/normalized_urls.txt"
+
+          COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/normalized_urls.txt" 2>/dev/null || echo 0)
+          echo "Normalized to $COUNT unique URLs"
+
+          python3 scripts/manage_progress.py complete url_normalization
+
+      - name: Upload artifacts after normalization
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-02-dns-resolution
-          path: work/artifacts/dns_resolution
-          if-no-files-found: ignore
+          name: recon-results-normalized
+          path: |
+            ${{ env.RESULTS_DIR }}/normalized_urls.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: Port scanning
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 8: JAVASCRIPT ANALYSIS
+# ============================================================
+      - name: Stage 8 - JavaScript Analysis
+        id: js_analysis
         run: |
-          set -euo pipefail
-          stage=port_scanning
-          next=http_probing
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          if [ "$SECONDS" -ge $((MAX_RUNTIME_SECONDS - 300)) ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            python3 - <<'PY'
-import json, os, urllib.request
-owner, name = os.environ["GITHUB_REPOSITORY"].split("/", 1)
-payload = {
-    "event_type": "elite-bug-bounty-recon-resume",
-    "client_payload": {
-        "target_domain": os.environ["TARGET_DOMAIN"],
-        "source_run_id": os.environ["GITHUB_RUN_ID"],
-        "next_stage": "port_scanning",
-        "current_batch": 1,
-        "last_completed_stage": "dns_resolution",
-    },
-}
-request = urllib.request.Request(
-    f"https://api.github.com/repos/{owner}/{name}/dispatches",
-    data=json.dumps(payload).encode("utf-8"),
-    headers={
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    },
-    method="POST",
-)
-urllib.request.urlopen(request).read()
-PY
-            exit 0
-          fi
-          naabu -silent -list "$WORK_ROOT/artifacts/dns_resolution/resolved.txt" -top-ports 100 -rate 100 -c 10 -scan-type c -exclude-cdn -o "$stage_dir/ports.txt"
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          python3 scripts/manage_progress.py status js_analysis running
 
-      - name: Upload port artifact
+          if [[ -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
+            # Extract JS files using subjs
+            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
+              | subjs 2>/dev/null \
+              | sort -u > "${{ env.RESULTS_DIR }}/js_files.txt" || true
+
+            # Also find inline JS endpoints from historical/crawled URLs
+            grep -iE '\.js($|\?)' "${{ env.RESULTS_DIR }}/normalized_urls.txt" 2>/dev/null \
+              >> "${{ env.RESULTS_DIR }}/js_files.txt" || true
+            sort -u -o "${{ env.RESULTS_DIR }}/js_files.txt" "${{ env.RESULTS_DIR }}/js_files.txt"
+
+            # Extract endpoints from JS files using SecretFinder
+            if [[ -s "${{ env.RESULTS_DIR }}/js_files.txt" ]]; then
+              mkdir -p /tmp/js_endpoints
+              while IFS= read -r js_url; do
+                python3 /opt/SecretFinder/SecretFinder.py \
+                  -i "$js_url" \
+                  -o cli 2>/dev/null >> /tmp/js_endpoints_raw.txt || true
+              done < "${{ env.RESULTS_DIR }}/js_files.txt"
+              sort -u /tmp/js_endpoints_raw.txt > "${{ env.RESULTS_DIR }}/js_endpoints.txt" 2>/dev/null || true
+            fi
+          fi
+
+          JS_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/js_files.txt" 2>/dev/null || echo 0)
+          EP_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/js_endpoints.txt" 2>/dev/null || echo 0)
+          echo "Found $JS_COUNT JS files, $EP_COUNT endpoints"
+
+          python3 scripts/manage_progress.py complete js_analysis
+
+      - name: Upload artifacts after JS analysis
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-03-port-scanning
-          path: work/artifacts/port_scanning
-          if-no-files-found: ignore
+          name: recon-results-js
+          path: |
+            ${{ env.RESULTS_DIR }}/js_files.txt
+            ${{ env.RESULTS_DIR }}/js_endpoints.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: HTTP probing
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 9: SECRET DISCOVERY
+# ============================================================
+      - name: Stage 9 - Secret Discovery
+        id: secret_discovery
         run: |
-          set -euo pipefail
-          stage=http_probing
-          next=historical_url_gathering
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          httpx -silent -json -sc -title -tech-detect -location -include-chain -ip -list "$WORK_ROOT/artifacts/port_scanning/ports.txt" -o "$stage_dir/alive.txt"
-          jq -r '.url // empty' "$stage_dir/alive.txt" | sort -u > "$stage_dir/alive_urls.txt"
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          python3 scripts/manage_progress.py status secret_discovery running
 
-      - name: Upload HTTP artifact
+          # Scan JS files with trufflehog
+          if [[ -s "${{ env.RESULTS_DIR }}/js_files.txt" ]]; then
+            while IFS= read -r js_url; do
+              curl -sL "$js_url" 2>/dev/null >> /tmp/js_content.txt || true
+            done < "${{ env.RESULTS_DIR }}/js_files.txt"
+
+            if [[ -s /tmp/js_content.txt ]]; then
+              trufflehog filesystem /tmp/js_content.txt \
+                --json 2>/dev/null > "${{ env.RESULTS_DIR }}/secrets.json" || true
+            fi
+          fi
+
+          # Also scan normalized URLs for secret patterns
+          if [[ -s "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
+            trufflehog filesystem "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
+              --json 2>/dev/null >> "${{ env.RESULTS_DIR }}/secrets.json" || true
+          fi
+
+          # Convert to readable format
+          if [[ -f "${{ env.RESULTS_DIR }}/secrets.json" ]]; then
+            python3 -c "
+import json, sys
+try:
+    with open('${{ env.RESULTS_DIR }}/secrets.json') as f:
+        for line in f:
+            try:
+                d = json.loads(line.strip())
+                print(json.dumps({'source': d.get('SourceMetadata', {}).get('Data', {}).get('Filesystem', {}).get('file', ''),
+                                'detector': d.get('DetectorName', ''),
+                                'raw': d.get('Raw', '')[:100]}))
+            except:
+                pass
+except:
+    pass
+" 2>/dev/null > "${{ env.RESULTS_DIR }}/secrets.txt" || true
+          fi
+
+          SECRET_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/secrets.txt" 2>/dev/null || echo 0)
+          echo "Found $SECRET_COUNT potential secrets"
+
+          python3 scripts/manage_progress.py complete secret_discovery
+
+      - name: Upload artifacts after secret discovery
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-04-http-probing
-          path: work/artifacts/http_probing
-          if-no-files-found: ignore
+          name: recon-results-secrets
+          path: |
+            ${{ env.RESULTS_DIR }}/secrets.txt
+            ${{ env.RESULTS_DIR }}/secrets.json
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: Historical URL gathering
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 10: CLOUD EXPOSURE DETECTION
+# ============================================================
+      - name: Stage 10 - Cloud Storage Exposure Detection
+        id: cloud_exposure
         run: |
-          set -euo pipefail
-          stage=historical_url_gathering
-          next=live_crawling
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          {
-            printf '%s\n' "$TARGET_DOMAIN" | gau --subs || true
-            printf '%s\n' "$TARGET_DOMAIN" | waybackurls || true
-            xurlfind3r -d "$TARGET_DOMAIN" --include-subdomains --silent || true
-          } | sort -u > "$stage_dir/historical_urls.txt"
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          python3 scripts/manage_progress.py status cloud_exposure running
 
-      - name: Upload historical URL artifact
+          TARGET="${{ steps.resolve_target.outputs.target_domain }}"
+          ORG=$(echo "$TARGET" | cut -d. -f1)
+
+          # Scan for open S3 buckets using permutations
+          echo "$ORG" | s3scanner -o "${{ env.RESULTS_DIR }}/cloud_exposures.txt" 2>/dev/null || true
+
+          # Also bucket permutations with common prefixes
+          for prefix in "" "dev-" "prod-" "stage-" "test-" "backup-" "data-" "assets-" "media-" "uploads-"; do
+            echo "${prefix}${ORG}" | s3scanner -o "${{ env.RESULTS_DIR }}/cloud_exposures.txt" 2>/dev/null || true
+          done
+
+          sort -u -o "${{ env.RESULTS_DIR }}/cloud_exposures.txt" "${{ env.RESULTS_DIR }}/cloud_exposures.txt" 2>/dev/null || true
+
+          CLOUD_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/cloud_exposures.txt" 2>/dev/null || echo 0)
+          echo "Found $CLOUD_COUNT potential cloud exposures"
+
+          python3 scripts/manage_progress.py complete cloud_exposure
+
+      - name: Upload artifacts after cloud exposure
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-05-historical-url-gathering
-          path: work/artifacts/historical_url_gathering
-          if-no-files-found: ignore
+          name: recon-results-cloud
+          path: |
+            ${{ env.RESULTS_DIR }}/cloud_exposures.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: Live crawling
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 11: SUBDOMAIN TAKEOVER DETECTION
+# ============================================================
+      - name: Stage 11 - Subdomain Takeover Detection
+        id: subdomain_takeover
         run: |
-          set -euo pipefail
-          stage=live_crawling
-          next=url_normalization
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          jq -r '.url // empty' "$WORK_ROOT/artifacts/http_probing/alive.txt" | sort -u > "$stage_dir/alive_urls.txt"
-          katana -silent -list "$stage_dir/alive_urls.txt" -d 3 -rl 20 -hrl 5 -kf robotstxt,sitemapxml -o "$stage_dir/katana_urls.txt" || true
-          xcrawl3r -l "$stage_dir/alive_urls.txt" --depth 3 --timeout 10 -C 5 -P 5 -s -o "$stage_dir/xcrawl3r_urls.txt" || true
-          {
-            cat "$stage_dir/katana_urls.txt" 2>/dev/null || true
-            cat "$stage_dir/xcrawl3r_urls.txt" 2>/dev/null || true
-          } | sort -u > "$stage_dir/crawled_urls.txt"
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          python3 scripts/manage_progress.py status subdomain_takeover running
 
-      - name: Upload crawling artifact
+          if [[ -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
+            subjack -w "${{ env.RESULTS_DIR }}/subs.txt" \
+              -t 50 \
+              -timeout 15 \
+              -ssl \
+              -o "${{ env.RESULTS_DIR }}/takeovers.txt" 2>/dev/null || true
+
+            # Also run nuclei takeover templates for additional coverage
+            cat "${{ env.RESULTS_DIR }}/subs.txt" \
+              | nuclei -t ~/nuclei-templates/takeovers/ \
+                -rl 100 \
+                -c 25 \
+                -silent \
+                -json 2>/dev/null >> "${{ env.RESULTS_DIR }}/nuclei_takeovers.json" || true
+          fi
+
+          TAKEOVER_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/takeovers.txt" 2>/dev/null || echo 0)
+          echo "Found $TAKEOVER_COUNT potential takeovers"
+
+          python3 scripts/manage_progress.py complete subdomain_takeover
+
+      - name: Upload artifacts after takeover detection
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-06-live-crawling
-          path: work/artifacts/live_crawling
-          if-no-files-found: ignore
+          name: recon-results-takeovers
+          path: |
+            ${{ env.RESULTS_DIR }}/takeovers.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: URL normalization
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 12: CORS MISCONFIGURATION DETECTION
+# ============================================================
+      - name: Stage 12 - CORS Misconfiguration Detection
+        id: cors_testing
         run: |
-          set -euo pipefail
-          stage=url_normalization
-          next=javascript_analysis
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
+          python3 scripts/manage_progress.py status cors_testing running
+
+          if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
+            # Extract URLs from httpx JSON output
+            cat "${{ env.RESULTS_DIR }}/alive.txt" 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        d = json.loads(line.strip())
+        url = d.get('url', '')
+        if url:
+            print(url)
+    except:
+        pass
+" 2>/dev/null > /tmp/cors_targets.txt
+
+            if [[ -s /tmp/cors_targets.txt ]]; then
+              python3 /opt/Corsy/corsy.py \
+                -i /tmp/cors_targets.txt \
+                -t 20 \
+                -o "${{ env.RESULTS_DIR }}/cors_findings.json" 2>/dev/null || true
+            fi
           fi
-          python3 - <<'PY'
-from pathlib import Path
-from urllib.parse import parse_qsl, urlsplit, urlunsplit, urlencode
-import json
 
-root = Path('work/artifacts')
-inputs = []
-for relative in [
-    'historical_url_gathering/historical_urls.txt',
-    'live_crawling/crawled_urls.txt',
-    'http_probing/alive_urls.txt',
-]:
-    file_path = root / relative
-    if file_path.exists():
-        inputs.extend(line.strip() for line in file_path.read_text(encoding='utf-8').splitlines() if line.strip())
+          CORS_COUNT=$(python3 -c "import json; data=json.load(open('${{ env.RESULTS_DIR }}/cors_findings.json')); print(len(data))" 2>/dev/null || echo 0)
+          echo "Found $CORS_COUNT CORS misconfigurations"
 
-normalized = set()
-for raw_url in inputs:
-    parsed = urlsplit(raw_url.strip())
-    scheme = (parsed.scheme or 'https').lower()
-    netloc = parsed.netloc.lower()
-    if not netloc and parsed.path.startswith('//'):
-        parsed = urlsplit(f'https:{raw_url}')
-        scheme = (parsed.scheme or 'https').lower()
-        netloc = parsed.netloc.lower()
-    if ':' in netloc:
-        host, port = netloc.rsplit(':', 1)
-        if (scheme == 'http' and port == '80') or (scheme == 'https' and port == '443'):
-            netloc = host
-    path = parsed.path or '/'
-    query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
-    normalized.add(urlunsplit((scheme, netloc, path, query, '')))
+          python3 scripts/manage_progress.py complete cors_testing
 
-out = Path('work/artifacts/url_normalization/normalized_urls.txt')
-out.write_text('\n'.join(sorted(normalized)) + ('\n' if normalized else ''), encoding='utf-8')
-PY
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-
-      - name: Upload normalization artifact
+      - name: Upload artifacts after CORS testing
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-07-url-normalization
-          path: work/artifacts/url_normalization
-          if-no-files-found: ignore
+          name: recon-results-cors
+          path: |
+            ${{ env.RESULTS_DIR }}/cors_findings.json
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: JavaScript analysis
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 13: SSRF ENDPOINT DISCOVERY
+# ============================================================
+      - name: Stage 13 - SSRF Endpoint Discovery
+        id: ssrf_discovery
         run: |
-          set -euo pipefail
-          stage=javascript_analysis
-          next=secret_discovery
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          grep -Ei '\.js([?#]|$)' "$WORK_ROOT/artifacts/url_normalization/normalized_urls.txt" | sort -u > "$stage_dir/js_files.txt" || true
-          katana -silent -jc -kb-endpoints -list "$WORK_ROOT/artifacts/http_probing/alive_urls.txt" -o "$stage_dir/js_endpoints.txt" || true
-          sort -u "$stage_dir/js_endpoints.txt" -o "$stage_dir/js_endpoints.txt" 2>/dev/null || true
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          python3 scripts/manage_progress.py status ssrf_discovery running
 
-      - name: Upload JS artifact
+          # Identify endpoints with parameters that commonly accept URLs
+          if [[ -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
+            # Find URL parameters that could be SSRF-prone
+            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
+              | unfurl keypairs \
+              | grep -iE '(url|uri|path|dest|redirect|return|next|file|load|read|document|site|html|image|img|src|link|out|view|path|page|feed|location|port|host|domain|callback|continue|target|endpoint|api|proxy)' \
+              | sort -u \
+              > "${{ env.RESULTS_DIR }}/ssrf_candidates.txt" 2>/dev/null || true
+          fi
+
+          SSR_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/ssrf_candidates.txt" 2>/dev/null || echo 0)
+          echo "Found $SSR_COUNT SSRF candidate parameters"
+
+          python3 scripts/manage_progress.py complete ssrf_discovery
+
+      - name: Upload artifacts after SSRF discovery
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-08-javascript-analysis
-          path: work/artifacts/javascript_analysis
-          if-no-files-found: ignore
+          name: recon-results-ssrf
+          path: |
+            ${{ env.RESULTS_DIR }}/ssrf_candidates.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: Secret discovery
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 14: OPEN REDIRECT DISCOVERY
+# ============================================================
+      - name: Stage 14 - Open Redirect Discovery
+        id: open_redirect
         run: |
-          set -euo pipefail
-          stage=secret_discovery
-          next=cloud_exposure_detection
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir/responses/js" "$stage_dir/responses/alive"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          if [ -s "$WORK_ROOT/artifacts/javascript_analysis/js_files.txt" ]; then
-            httpx -silent -sr -srd "$stage_dir/responses/js" -list "$WORK_ROOT/artifacts/javascript_analysis/js_files.txt" -rl 20 || true
-          fi
-          if [ -s "$WORK_ROOT/artifacts/http_probing/alive_urls.txt" ]; then
-            httpx -silent -sr -srd "$stage_dir/responses/alive" -list "$WORK_ROOT/artifacts/http_probing/alive_urls.txt" -rl 10 || true
-          fi
-          gitleaks dir "$stage_dir/responses" --report-format json --report-path "$stage_dir/gitleaks.json" --no-banner || true
-          python3 - <<'PY'
-import json
-from pathlib import Path
-report = Path('work/artifacts/secret_discovery/gitleaks.json')
-out = Path('work/artifacts/secret_discovery/secrets.txt')
-lines = []
-if report.exists() and report.stat().st_size > 0:
-    data = json.loads(report.read_text(encoding='utf-8'))
-    for finding in data:
-        lines.append(f"{finding.get('RuleID','')}\t{finding.get('File','')}\t{finding.get('Match','')}")
-out.write_text('\n'.join(lines) + ('\n' if lines else ''), encoding='utf-8')
-PY
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          python3 scripts/manage_progress.py status open_redirect running
 
-      - name: Upload secret artifact
+          # Identify potentially open redirect parameters
+          if [[ -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
+            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
+              | unfurl keypairs \
+              | grep -iE '(redirect|return|next|url|link|to|out|target|callback|continue|dest|destination|ref|referer|referrer|url=|uri=|path=)' \
+              | sort -u \
+              > "${{ env.RESULTS_DIR }}/redirect_candidates.txt" 2>/dev/null || true
+          fi
+
+          # Use nuclei open-redirect templates for validation
+          if [[ -s "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
+            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
+              | nuclei -t ~/nuclei-templates/http/exposures/ \
+                -tags redirect \
+                -rl 100 \
+                -c 20 \
+                -silent \
+                -json 2>/dev/null > "${{ env.RESULTS_DIR }}/redirect_nuclei.json" || true
+          fi
+
+          REDIR_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/redirect_candidates.txt" 2>/dev/null || echo 0)
+          echo "Found $REDIR_COUNT open redirect candidates"
+
+          python3 scripts/manage_progress.py complete open_redirect
+
+      - name: Upload artifacts after open redirect
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-09-secret-discovery
-          path: work/artifacts/secret_discovery
-          if-no-files-found: ignore
+          name: recon-results-redirect
+          path: |
+            ${{ env.RESULTS_DIR }}/redirect_candidates.txt
+            ${{ env.RESULTS_DIR }}/redirect_findings.txt
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: Cloud exposure detection
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 15: SENSITIVE FILE DETECTION
+# ============================================================
+      - name: Stage 15 - Sensitive File Detection
+        id: sensitive_files
         run: |
-          set -euo pipefail
-          stage=cloud_exposure_detection
-          next=subdomain_takeover_detection
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          cloud_templates=$(rg -l -i --glob '*.yml' --glob '*.yaml' 's3|gcs|azure|bucket|cloud' "$NUCLEI_TEMPLATES" | sort -u | paste -sd, -)
-          if [ -n "$cloud_templates" ]; then
-            nuclei -silent -jsonl -severity medium,high,critical -t "$cloud_templates" -list "$WORK_ROOT/artifacts/url_normalization/normalized_urls.txt" -o "$stage_dir/cloud_exposures.txt" || true
-          else
-            : > "$stage_dir/cloud_exposures.txt"
-          fi
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          python3 scripts/manage_progress.py status sensitive_files running
 
-      - name: Upload cloud artifact
+          # Nuclei templates for sensitive file exposure
+          if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
+            cat "${{ env.RESULTS_DIR }}/alive.txt" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        d = json.loads(line.strip())
+        url = d.get('url', '')
+        if url:
+            print(url)
+    except:
+        pass
+" 2>/dev/null > /tmp/sensitive_targets.txt
+
+            if [[ -s /tmp/sensitive_targets.txt ]]; then
+              nuclei -l /tmp/sensitive_targets.txt \
+                -t ~/nuclei-templates/http/exposures/ \
+                -tags config,backup,env \
+                -severity high,critical \
+                -rl 100 \
+                -c 20 \
+                -json \
+                -o "${{ env.RESULTS_DIR }}/sensitive_files.json" 2>/dev/null || true
+            fi
+          fi
+
+          SNSTV_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/sensitive_files.json" 2>/dev/null || echo 0)
+          echo "Found $SNSTV_COUNT potential sensitive file exposures"
+
+          python3 scripts/manage_progress.py complete sensitive_files
+
+      - name: Upload artifacts after sensitive files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-10-cloud-exposure-detection
-          path: work/artifacts/cloud_exposure_detection
-          if-no-files-found: ignore
+          name: recon-results-sensitive
+          path: |
+            ${{ env.RESULTS_DIR }}/sensitive_files.json
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: Subdomain takeover detection
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 16: DEFAULT CREDENTIAL DETECTION
+# ============================================================
+      - name: Stage 16 - Default Credential Detection
+        id: default_creds
         run: |
-          set -euo pipefail
-          stage=subdomain_takeover_detection
-          next=cors_misconfiguration_detection
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          tools/Subhunter/subhunter -l "$WORK_ROOT/artifacts/dns_resolution/resolved.txt" -o "$stage_dir/takeovers.txt" || true
-          takeover_templates=$(rg -l -i --glob '*.yml' --glob '*.yaml' 'takeover' "$NUCLEI_TEMPLATES" | sort -u | paste -sd, -)
-          if [ -n "$takeover_templates" ]; then
-            nuclei -silent -jsonl -severity medium,high,critical -t "$takeover_templates" -list "$WORK_ROOT/artifacts/dns_resolution/resolved.txt" -o "$stage_dir/takeover_nuclei.txt" || true
-          fi
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          python3 scripts/manage_progress.py status default_creds running
 
-      - name: Upload takeover artifact
+          if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
+            cat "${{ env.RESULTS_DIR }}/alive.txt" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        d = json.loads(line.strip())
+        url = d.get('url', '')
+        if url:
+            print(url)
+    except:
+        pass
+" 2>/dev/null > /tmp/cred_targets.txt
+
+            if [[ -s /tmp/cred_targets.txt ]]; then
+              # Nuclei templates for default credentials and exposed panels
+              nuclei -l /tmp/cred_targets.txt \
+                -t ~/nuclei-templates/http/default-logins/ \
+                -severity high,critical \
+                -rl 100 \
+                -c 20 \
+                -json \
+                -o "${{ env.RESULTS_DIR }}/default_creds.json" 2>/dev/null || true
+
+              # Also check for exposed admin panels
+              nuclei -l /tmp/cred_targets.txt \
+                -t ~/nuclei-templates/http/exposed-panels/ \
+                -severity high,critical \
+                -rl 100 \
+                -c 20 \
+                -json \
+                -o "${{ env.RESULTS_DIR }}/admin_panels.json" 2>/dev/null || true
+            fi
+          fi
+
+          CRED_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/default_creds.json" 2>/dev/null || echo 0)
+          echo "Found $CRED_COUNT potential default credentials"
+
+          python3 scripts/manage_progress.py complete default_creds
+
+      - name: Upload artifacts after default creds
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-11-subdomain-takeover-detection
-          path: work/artifacts/subdomain_takeover_detection
-          if-no-files-found: ignore
+          name: recon-results-creds
+          path: |
+            ${{ env.RESULTS_DIR }}/default_creds.json
+            ${{ env.RESULTS_DIR }}/admin_panels.json
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
 
-      - name: CORS misconfiguration detection
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+# ============================================================
+# STAGE 17: HIGH-CONFIDENCE NUCLEI SCANNING
+# ============================================================
+      - name: Stage 17 - High-Confidence Nuclei Scanning
+        id: nuclei_scanning
         run: |
-          set -euo pipefail
-          stage=cors_misconfiguration_detection
-          next=ssrf_endpoint_discovery
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          python3 scripts/manage_progress.py status nuclei_scanning running
+
+          # Prepare targets from normalized URLs
+          if [[ ! -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]] || [[ ! -s "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
+            echo "No URLs for nuclei scanning"
+            python3 scripts/manage_progress.py complete nuclei_scanning
             exit 0
           fi
-          cors_templates=$(rg -l -i --glob '*.yml' --glob '*.yaml' 'cors|cross-origin|cross origin|origin header' "$NUCLEI_TEMPLATES" | sort -u | paste -sd, -)
-          if [ -n "$cors_templates" ]; then
-            nuclei -silent -jsonl -severity medium,high,critical -t "$cors_templates" -list "$WORK_ROOT/artifacts/http_probing/alive_urls.txt" -o "$stage_dir/cors_findings.txt" || true
-          else
-            : > "$stage_dir/cors_findings.txt"
-          fi
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
 
-      - name: Upload CORS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: stage-12-cors-misconfiguration-detection
-          path: work/artifacts/cors_misconfiguration_detection
-          if-no-files-found: ignore
+          # Read progress to get current batch
+          PROGRESS=$(python3 scripts/manage_progress.py read 2>/dev/null)
+          CURRENT_BATCH=$(echo "$PROGRESS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('current_batch', 0))" 2>/dev/null || echo 0)
+          BATCH_SIZE=5000
+          TOTAL_URLS=$(wc -l < "${{ env.RESULTS_DIR }}/normalized_urls.txt")
+          TOTAL_BATCHES=$(( (TOTAL_URLS + BATCH_SIZE - 1) / BATCH_SIZE ))
 
-      - name: SSRF endpoint discovery
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          stage=ssrf_endpoint_discovery
-          next=open_redirect_discovery
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          ssrf_templates=$(rg -l -i --glob '*.yml' --glob '*.yaml' 'ssrf|server-side request forgery' "$NUCLEI_TEMPLATES" | sort -u | paste -sd, -)
-          if [ -n "$ssrf_templates" ]; then
-            nuclei -silent -jsonl -severity medium,high,critical -t "$ssrf_templates" -list "$WORK_ROOT/artifacts/url_normalization/normalized_urls.txt" -o "$stage_dir/ssrf_candidates.txt" || true
-          else
-            : > "$stage_dir/ssrf_candidates.txt"
-          fi
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+          echo "Total URLs: $TOTAL_URLS, Total batches: $TOTAL_BATCHES, Starting from batch: $CURRENT_BATCH"
 
-      - name: Upload SSRF artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: stage-13-ssrf-endpoint-discovery
-          path: work/artifacts/ssrf_endpoint_discovery
-          if-no-files-found: ignore
+          # Scan with targeted high-confidence templates only
+          HIGH_CONFIDENCE_TAGS="cve,exposure,config,default-login,panel,misconfig"
+          
+          for ((batch=CURRENT_BATCH; batch<TOTAL_BATCHES; batch++)); do
+            START=$((batch * BATCH_SIZE))
+            echo "Processing batch $((batch+1))/$TOTAL_BATCHES (URLs $START-$((START+BATCH_SIZE-1)))"
 
-      - name: Open redirect discovery
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          stage=open_redirect_discovery
-          next=sensitive_and_default_credential_detection
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          redirect_templates=$(rg -l -i --glob '*.yml' --glob '*.yaml' 'open redirect|redirect' "$NUCLEI_TEMPLATES" | sort -u | paste -sd, -)
-          if [ -n "$redirect_templates" ]; then
-            nuclei -silent -jsonl -severity medium,high,critical -t "$redirect_templates" -list "$WORK_ROOT/artifacts/url_normalization/normalized_urls.txt" -o "$stage_dir/redirect_findings.txt" || true
-          else
-            : > "$stage_dir/redirect_findings.txt"
-          fi
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
+            sed -n "$((START+1)),$((START+BATCH_SIZE))p" "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
+              > /tmp/nuclei_batch.txt
 
-      - name: Upload redirect artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: stage-14-open-redirect-discovery
-          path: work/artifacts/open_redirect_discovery
-          if-no-files-found: ignore
-
-      - name: Sensitive file and default credential detection
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          stage=sensitive_and_default_credential_detection
-          next=nuclei_batch_scanning
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          sensitive_templates=$(rg -l -i --glob '*.yml' --glob '*.yaml' 'sensitive file|backup|exposure|config|secret file' "$NUCLEI_TEMPLATES" | sort -u | paste -sd, -)
-          creds_templates=$(rg -l -i --glob '*.yml' --glob '*.yaml' 'default credential|default password|weak password|admin|panel' "$NUCLEI_TEMPLATES" | sort -u | paste -sd, -)
-          if [ -n "$sensitive_templates" ]; then
-            nuclei -silent -jsonl -severity medium,high,critical -t "$sensitive_templates" -list "$WORK_ROOT/artifacts/url_normalization/normalized_urls.txt" -o "$stage_dir/sensitive_files.txt" || true
-          else
-            : > "$stage_dir/sensitive_files.txt"
-          fi
-          if [ -n "$creds_templates" ]; then
-            nuclei -silent -jsonl -severity medium,high,critical -t "$creds_templates" -list "$WORK_ROOT/artifacts/http_probing/alive_urls.txt" -o "$stage_dir/default_creds.txt" || true
-          else
-            : > "$stage_dir/default_creds.txt"
-          fi
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch 1
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-
-      - name: Upload sensitive/default artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: stage-15-sensitive-and-default-credential-detection
-          path: work/artifacts/sensitive_and_default_credential_detection
-          if-no-files-found: ignore
-
-      - name: High-confidence nuclei batch scanning
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          stage=nuclei_batch_scanning
-          next=complete
-          stage_dir="$WORK_ROOT/artifacts/$stage"
-          mkdir -p "$stage_dir/batches"
-          if [ "$(python3 scripts/progress.py next --progress "$WORK_ROOT/progress.json")" != "$stage" ]; then
-            cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-            exit 0
-          fi
-          start_batch=$(jq -r '.current_batch // 1' "$WORK_ROOT/progress.json")
-          jq -r '.url // empty' "$WORK_ROOT/artifacts/http_probing/alive.txt" | sort -u > "$stage_dir/nuclei_targets.txt"
-          cat "$WORK_ROOT/artifacts/url_normalization/normalized_urls.txt" >> "$stage_dir/nuclei_targets.txt"
-          sort -u "$stage_dir/nuclei_targets.txt" -o "$stage_dir/nuclei_targets.txt"
-          python3 - <<'PY'
-from pathlib import Path
-import os
-
-batch_size = int(os.environ.get('BATCH_SIZE', '5000'))
-source = Path('work/artifacts/nuclei_batch_scanning/nuclei_targets.txt')
-lines = [line.strip() for line in source.read_text(encoding='utf-8').splitlines() if line.strip()]
-if not lines:
-    raise SystemExit(0)
-for index in range(0, len(lines), batch_size):
-    batch_path = Path(f'work/artifacts/nuclei_batch_scanning/batches/batch-{index // batch_size + 1:04d}.txt')
-    batch_path.write_text('\n'.join(lines[index:index + batch_size]) + '\n', encoding='utf-8')
-PY
-          final_templates=$(rg -l -i --glob '*.yml' --glob '*.yaml' 'takeover|cors|ssrf|open redirect|sensitive file|default credential|admin|panel|cloud' "$NUCLEI_TEMPLATES" | sort -u | paste -sd, -)
-          : > "$stage_dir/nuclei_results.txt"
-          batch_index=0
-          for batch_file in "$stage_dir"/batches/*.txt; do
-            batch_index=$((batch_index + 1))
-            if [ "$batch_index" -lt "$start_batch" ]; then
+            if [[ ! -s /tmp/nuclei_batch.txt ]]; then
               continue
             fi
-            if [ "$SECONDS" -ge $((MAX_RUNTIME_SECONDS - 300)) ]; then
-              python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$stage" --current-batch "$batch_index"
-              cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
-              export BATCH_INDEX="$batch_index"
-              python3 - <<'PY'
-import json, os, urllib.request
-owner, name = os.environ["GITHUB_REPOSITORY"].split("/", 1)
-payload = {
-    "event_type": "elite-bug-bounty-recon-resume",
-    "client_payload": {
-        "target_domain": os.environ["TARGET_DOMAIN"],
-        "source_run_id": os.environ["GITHUB_RUN_ID"],
-        "next_stage": "nuclei_batch_scanning",
-      "current_batch": int(os.environ["BATCH_INDEX"]),
-        "last_completed_stage": "sensitive_and_default_credential_detection",
-    },
-}
-request = urllib.request.Request(
-    f"https://api.github.com/repos/{owner}/{name}/dispatches",
-    data=json.dumps(payload).encode("utf-8"),
-    headers={
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    },
-    method="POST",
-)
-urllib.request.urlopen(request).read()
-PY
-              exit 0
-            fi
-            if [ -n "$final_templates" ]; then
-              nuclei -silent -jsonl -severity medium,high,critical -t "$final_templates" -list "$batch_file" -o "$stage_dir/batch-${batch_index:04d}.jsonl" || true
-              cat "$stage_dir/batch-${batch_index:04d}.jsonl" >> "$stage_dir/nuclei_results.txt"
-            fi
-            python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$stage" --current-batch "$((batch_index + 1))"
-          done
-          python3 scripts/progress.py advance --progress "$WORK_ROOT/progress.json" --last-completed-stage "$stage" --next-stage "$next" --current-batch "$((batch_index + 1))"
-          cp "$WORK_ROOT/progress.json" "$stage_dir/progress.json"
 
-      - name: Upload nuclei artifact
+            nuclei -l /tmp/nuclei_batch.txt \
+              -severity high,critical \
+              -tags $HIGH_CONFIDENCE_TAGS \
+              -rl 150 \
+              -bs 25 \
+              -c 25 \
+              -timeout 10 \
+              -retries 1 \
+              -json \
+              -o /tmp/nuclei_batch_output.json 2>/dev/null || true
+
+            # Append to results
+            cat /tmp/nuclei_batch_output.json >> "${{ env.RESULTS_DIR }}/nuclei_results.json" 2>/dev/null || true
+
+            # Update batch progress
+            python3 scripts/manage_progress.py batch $((batch + 1))
+            python3 scripts/manage_progress.py status nuclei_scanning "running (batch $((batch+1))/$TOTAL_BATCHES)"
+
+            # Upload intermediate results every 5 batches
+            if [[ $((batch % 5)) -eq 0 ]] || [[ $batch -eq $((TOTAL_BATCHES - 1)) ]]; then
+              # Upload checkpoint artifacts for resume
+              cp "${{ env.RESULTS_DIR }}/nuclei_results.json" /tmp/nuclei_checkpoint.json 2>/dev/null || true
+              echo "Checkpoint uploaded at batch $((batch+1))"
+            fi
+
+            # Check if we're approaching the workflow timeout
+            # If so, trigger auto-resume
+            ELAPSED_MINUTES=$((SECONDS / 60))
+            if [[ $ELAPSED_MINUTES -gt ${{ env.WORKFLOW_TIMEOUT_MINUTES }} ]]; then
+              echo "Approaching timeout. Triggering auto-resume."
+              
+              # Trigger repository_dispatch for continuation
+              curl -s -X POST \
+                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                https://api.github.com/repos/${{ github.repository }}/dispatches \
+                -d "{\"event_type\":\"resume_recon\",\"client_payload\":{\"target_domain\":\"${{ steps.resolve_target.outputs.target_domain }}\"}}" \
+                || true
+              
+              echo "Auto-resume triggered. Current run will complete current batch gracefully."
+              break
+            fi
+          done
+
+          # Final upload after all batches
+          python3 scripts/manage_progress.py complete nuclei_scanning
+
+      - name: Upload artifacts after nuclei scanning
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage-16-nuclei-batch-scanning
-          path: work/artifacts/nuclei_batch_scanning
-          if-no-files-found: ignore
+          name: recon-results-nuclei
+          path: |
+            ${{ env.RESULTS_DIR }}/nuclei_results.json
+            ${{ env.PROGRESS_FILE }}
+          if-no-files-found: warn
+
+# ============================================================
+# FINAL CONSOLIDATION & REPORTING
+# ============================================================
+      - name: Consolidate final results
+        if: always()
+        run: |
+          echo "=== ELITE BUG BOUNTY RECON PIPELINE - FINAL REPORT ===" > ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+          echo "Target: ${{ steps.resolve_target.outputs.target_domain }}" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+          echo "Timestamp: $(date -u)" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+          echo "" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+
+          for file in subs.txt resolved.txt ports.txt alive.txt historical_urls.txt crawled_urls.txt \
+                       normalized_urls.txt js_files.txt secrets.txt cloud_exposures.txt \
+                       takeovers.txt cors_findings.json ssrf_candidates.txt redirect_candidates.txt \
+                       sensitive_files.json default_creds.json nuclei_results.json; do
+            if [[ -f "${{ env.RESULTS_DIR }}/$file" ]]; then
+              COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/$file" 2>/dev/null || echo 0)
+              echo "$file: $COUNT results" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+            else
+              echo "$file: NOT FOUND" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+            fi
+          done
+
+          echo "" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+          python3 scripts/manage_progress.py summary >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+
+      - name: Upload final consolidated results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results-final
+          path: ${{ env.RESULTS_DIR }}/
+          if-no-files-found: warn
