@@ -130,8 +130,11 @@ jobs:
 # ============================================================
       - name: Stage 1 - Subdomain Enumeration
         id: subdomain_enumeration
-        if: steps.checkpoint.outputs.progress_state != 'resume' || (steps.checkpoint.outputs.progress_state == 'resume' && !contains(fromJson(steps.checkpoint.outputs.progress_state), 'subdomain_enumeration'))
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['subdomain_enumeration'].get('status')=='completed' else 1)" 2>/dev/null; then
+            echo "Stage 1 already completed, skipping"
+            exit 0
+          fi
           python3 scripts/manage_progress.py status subdomain_enumeration running
 
           TARGET="${{ steps.resolve_target.outputs.target_domain }}"
@@ -168,6 +171,7 @@ jobs:
       - name: Stage 2 - DNS Resolution
         id: dns_resolution
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['dns_resolution'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 2 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status dns_resolution running
 
           if [[ ! -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
@@ -204,6 +208,7 @@ jobs:
       - name: Stage 3 - Port Scanning
         id: port_scanning
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['port_scanning'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 3 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status port_scanning running
 
           if [[ ! -f "${{ env.RESULTS_DIR }}/resolved.txt" ]]; then
@@ -244,6 +249,7 @@ jobs:
       - name: Stage 4 - HTTP Probing
         id: http_probing
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['http_probing'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 4 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status http_probing running
 
           if [[ ! -f "${{ env.RESULTS_DIR }}/ports.txt" ]] && [[ ! -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
@@ -289,6 +295,7 @@ jobs:
       - name: Stage 5 - Historical URL Gathering
         id: historical_urls
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['historical_urls'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 5 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status historical_urls running
 
           TARGET="${{ steps.resolve_target.outputs.target_domain }}"
@@ -325,6 +332,7 @@ jobs:
       - name: Stage 6 - Live Crawling
         id: live_crawling
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['live_crawling'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 6 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status live_crawling running
 
           TARGET="${{ steps.resolve_target.outputs.target_domain }}"
@@ -332,17 +340,7 @@ jobs:
           # Use katana on live targets
           if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
             # Extract URLs from httpx output (JSON)
-            cat "${{ env.RESULTS_DIR }}/alive.txt" 2>/dev/null | python3 -c "
-import sys, json
-for line in sys.stdin:
-    try:
-        d = json.loads(line.strip())
-        url = d.get('url', '')
-        if url:
-            print(url)
-    except:
-        pass
-" 2>/dev/null > /tmp/live_urls.txt
+            jq -r 'select(.url != null) | .url' "${{ env.RESULTS_DIR }}/alive.txt" > /tmp/live_urls.txt 2>/dev/null
 
             if [[ -s /tmp/live_urls.txt ]]; then
               katana -list /tmp/live_urls.txt \
@@ -377,6 +375,7 @@ for line in sys.stdin:
       - name: Stage 7 - URL Normalization
         id: url_normalization
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['url_normalization'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 7 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status url_normalization running
 
           # Merge all URL sources
@@ -416,6 +415,7 @@ for line in sys.stdin:
       - name: Stage 8 - JavaScript Analysis
         id: js_analysis
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['js_analysis'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 8 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status js_analysis running
 
           if [[ -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
@@ -464,6 +464,7 @@ for line in sys.stdin:
       - name: Stage 9 - Secret Discovery
         id: secret_discovery
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['secret_discovery'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 9 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status secret_discovery running
 
           # Scan JS files with trufflehog
@@ -486,21 +487,7 @@ for line in sys.stdin:
 
           # Convert to readable format
           if [[ -f "${{ env.RESULTS_DIR }}/secrets.json" ]]; then
-            python3 -c "
-import json, sys
-try:
-    with open('${{ env.RESULTS_DIR }}/secrets.json') as f:
-        for line in f:
-            try:
-                d = json.loads(line.strip())
-                print(json.dumps({'source': d.get('SourceMetadata', {}).get('Data', {}).get('Filesystem', {}).get('file', ''),
-                                'detector': d.get('DetectorName', ''),
-                                'raw': d.get('Raw', '')[:100]}))
-            except:
-                pass
-except:
-    pass
-" 2>/dev/null > "${{ env.RESULTS_DIR }}/secrets.txt" || true
+            jq -r '{source: (.SourceMetadata.Data.Filesystem.file // ""), detector: .DetectorName, raw: (.Raw[0:100] // "")} | "Source: \(.source) | Detector: \(.detector) | Raw: \(.raw)"' "${{ env.RESULTS_DIR }}/secrets.json" 2>/dev/null > "${{ env.RESULTS_DIR }}/secrets.txt" || true
           fi
 
           SECRET_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/secrets.txt" 2>/dev/null || echo 0)
@@ -525,6 +512,7 @@ except:
       - name: Stage 10 - Cloud Storage Exposure Detection
         id: cloud_exposure
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['cloud_exposure'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 10 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status cloud_exposure running
 
           TARGET="${{ steps.resolve_target.outputs.target_domain }}"
@@ -561,6 +549,7 @@ except:
       - name: Stage 11 - Subdomain Takeover Detection
         id: subdomain_takeover
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['subdomain_takeover'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 11 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status subdomain_takeover running
 
           if [[ -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
@@ -600,21 +589,11 @@ except:
       - name: Stage 12 - CORS Misconfiguration Detection
         id: cors_testing
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['cors_testing'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 12 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status cors_testing running
 
           if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
-            # Extract URLs from httpx JSON output
-            cat "${{ env.RESULTS_DIR }}/alive.txt" 2>/dev/null | python3 -c "
-import sys, json
-for line in sys.stdin:
-    try:
-        d = json.loads(line.strip())
-        url = d.get('url', '')
-        if url:
-            print(url)
-    except:
-        pass
-" 2>/dev/null > /tmp/cors_targets.txt
+            jq -r 'select(.url != null) | .url' "${{ env.RESULTS_DIR }}/alive.txt" > /tmp/cors_targets.txt 2>/dev/null
 
             if [[ -s /tmp/cors_targets.txt ]]; then
               python3 /opt/Corsy/corsy.py \
@@ -645,6 +624,7 @@ for line in sys.stdin:
       - name: Stage 13 - SSRF Endpoint Discovery
         id: ssrf_discovery
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['ssrf_discovery'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 13 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status ssrf_discovery running
 
           # Identify endpoints with parameters that commonly accept URLs
@@ -678,6 +658,7 @@ for line in sys.stdin:
       - name: Stage 14 - Open Redirect Discovery
         id: open_redirect
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['open_redirect'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 14 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status open_redirect running
 
           # Identify potentially open redirect parameters
@@ -722,21 +703,12 @@ for line in sys.stdin:
       - name: Stage 15 - Sensitive File Detection
         id: sensitive_files
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['sensitive_files'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 15 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status sensitive_files running
 
           # Nuclei templates for sensitive file exposure
           if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
-            cat "${{ env.RESULTS_DIR }}/alive.txt" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    try:
-        d = json.loads(line.strip())
-        url = d.get('url', '')
-        if url:
-            print(url)
-    except:
-        pass
-" 2>/dev/null > /tmp/sensitive_targets.txt
+            jq -r 'select(.url != null) | .url' "${{ env.RESULTS_DIR }}/alive.txt" > /tmp/sensitive_targets.txt 2>/dev/null
 
             if [[ -s /tmp/sensitive_targets.txt ]]; then
               nuclei -l /tmp/sensitive_targets.txt \
@@ -771,20 +743,11 @@ for line in sys.stdin:
       - name: Stage 16 - Default Credential Detection
         id: default_creds
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['default_creds'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 16 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status default_creds running
 
           if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
-            cat "${{ env.RESULTS_DIR }}/alive.txt" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    try:
-        d = json.loads(line.strip())
-        url = d.get('url', '')
-        if url:
-            print(url)
-    except:
-        pass
-" 2>/dev/null > /tmp/cred_targets.txt
+            jq -r 'select(.url != null) | .url' "${{ env.RESULTS_DIR }}/alive.txt" > /tmp/cred_targets.txt 2>/dev/null
 
             if [[ -s /tmp/cred_targets.txt ]]; then
               # Nuclei templates for default credentials and exposed panels
@@ -829,6 +792,7 @@ for line in sys.stdin:
       - name: Stage 17 - High-Confidence Nuclei Scanning
         id: nuclei_scanning
         run: |
+          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['nuclei_scanning'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 17 already completed, skipping"; exit 0; fi
           python3 scripts/manage_progress.py status nuclei_scanning running
 
           # Prepare targets from normalized URLs
