@@ -146,11 +146,11 @@ jobs:
           if jq -e '.stages.subdomain_enumeration.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 1 already completed, skipping"; exit 0; fi
           jq '.stages.subdomain_enumeration.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           TARGET="${{ steps.resolve_target.outputs.target_domain }}"
-          subfinder -d "$TARGET" -all -o "${{ env.RESULTS_DIR }}/subfinder.txt" 2>/dev/null
-          assetfinder "$TARGET" > "${{ env.RESULTS_DIR }}/assetfinder.txt" 2>/dev/null
-          amass enum -passive -d "$TARGET" -o "${{ env.RESULTS_DIR }}/amass.txt" 2>/dev/null || true
-          cat "${{ env.RESULTS_DIR }}"/subfinder.txt "${{ env.RESULTS_DIR }}"/assetfinder.txt "${{ env.RESULTS_DIR }}"/amass.txt 2>/dev/null \
-            | sort -u | grep -E "\.$TARGET$" | grep -v "^\*" > "${{ env.RESULTS_DIR }}/subs.txt"
+           subfinder -d "$TARGET" -all -o "${{ env.RESULTS_DIR }}/subfinder.txt" 2>/dev/null || true
+           assetfinder "$TARGET" > "${{ env.RESULTS_DIR }}/assetfinder.txt" 2>/dev/null || true
+           amass enum -passive -d "$TARGET" -o "${{ env.RESULTS_DIR }}/amass.txt" 2>/dev/null || true
+           cat "${{ env.RESULTS_DIR }}"/subfinder.txt "${{ env.RESULTS_DIR }}"/assetfinder.txt "${{ env.RESULTS_DIR }}"/amass.txt 2>/dev/null \
+             | sort -u | grep -E "\.$TARGET$" | grep -v "^\*" > "${{ env.RESULTS_DIR }}/subs.txt" || true
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/subs.txt" 2>/dev/null || echo 0)
           echo "Found $COUNT subdomains"
           jq '.stages.subdomain_enumeration.status = "completed" | .last_completed_stage = "subdomain_enumeration" | .next_stage = "dns_resolution" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
@@ -174,7 +174,7 @@ jobs:
           if jq -e '.stages.dns_resolution.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 2 already completed, skipping"; exit 0; fi
           jq '.stages.dns_resolution.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ ! -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then echo "No subdomains to resolve"; jq '.stages.dns_resolution.status = "completed" | .last_completed_stage = "dns_resolution" | .next_stage = "port_scanning" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"; exit 0; fi
-          dnsx -l "${{ env.RESULTS_DIR }}/subs.txt" -a -cname -mx -ptr -wildcard -o "${{ env.RESULTS_DIR }}/resolved.txt" -r 8.8.8.8,1.1.1.1,8.8.4.4 2>/dev/null
+           dnsx -l "${{ env.RESULTS_DIR }}/subs.txt" -a -cname -mx -ptr -wildcard -o "${{ env.RESULTS_DIR }}/resolved.txt" -r 8.8.8.8,1.1.1.1,8.8.4.4 2>/dev/null || true
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/resolved.txt" 2>/dev/null || echo 0)
           echo "Resolved $COUNT subdomains"
           jq '.stages.dns_resolution.status = "completed" | .last_completed_stage = "dns_resolution" | .next_stage = "port_scanning" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
@@ -303,7 +303,7 @@ jobs:
           jq '.stages.url_normalization.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           cat "${{ env.RESULTS_DIR }}"/historical_urls.txt "${{ env.RESULTS_DIR }}"/crawled_urls.txt 2>/dev/null | sort -u > /tmp/all_raw_urls.txt
           if [[ ! -s /tmp/all_raw_urls.txt ]]; then echo "No URLs to normalize"; jq '.stages.url_normalization.status = "completed" | .last_completed_stage = "url_normalization" | .next_stage = "js_analysis" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"; exit 0; fi
-          cat /tmp/all_raw_urls.txt | unfurl format "%s://%d%p" | sort -u > "${{ env.RESULTS_DIR }}/normalized_urls.txt"
+           cat /tmp/all_raw_urls.txt | unfurl format "%s://%d%p" | sort -u > "${{ env.RESULTS_DIR }}/normalized_urls.txt" || true
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/normalized_urls.txt" 2>/dev/null || echo 0)
           echo "Normalized to $COUNT unique URLs"
           jq '.stages.url_normalization.status = "completed" | .last_completed_stage = "url_normalization" | .next_stage = "js_analysis" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
