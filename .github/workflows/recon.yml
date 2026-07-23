@@ -7,11 +7,6 @@ on:
         description: 'Target domain to recon (e.g., example.com)'
         required: true
         type: string
-      debug:
-        description: 'Enable debug mode (skip to specific stage)'
-        required: false
-        default: ''
-        type: string
   repository_dispatch:
     types: [resume_recon]
 
@@ -20,7 +15,6 @@ env:
   PROGRESS_FILE: progress.json
   RESULTS_DIR: results
   WORKFLOW_TIMEOUT_MINUTES: 330
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 defaults:
   run:
@@ -30,12 +24,11 @@ jobs:
   recon:
     runs-on: ubuntu-latest
     outputs:
-      progress_state: ${{ steps.checkpoint.outputs.progress_state }}
       target_domain: ${{ steps.resolve_target.outputs.target_domain }}
     steps:
 
 # ============================================================
-# SETUP & CHECKPOINT RESTORE
+# SETUP
 # ============================================================
       - name: Resolve target domain
         id: resolve_target
@@ -52,23 +45,44 @@ jobs:
         id: checkpoint
         run: |
           mkdir -p ${{ env.RESULTS_DIR }}
-          
-          # Download artifacts from previous runs if they exist
           if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
             echo "Auto-resume triggered - restoring checkpoint"
-            # Artifacts are automatically downloaded via actions/download-artifact
           fi
-          
-          # Initialize or read progress
           if [[ -f "${{ env.PROGRESS_FILE }}" ]]; then
             echo "Found existing progress file"
-            NEXT_STAGE=$(python3 scripts/manage_progress.py read 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('next_stage','subdomain_enumeration'))" 2>/dev/null || echo "subdomain_enumeration")
-            echo "progress_state=resume" >> $GITHUB_OUTPUT
+            NEXT_STAGE=$(jq -r '.next_stage // "subdomain_enumeration"' "${{ env.PROGRESS_FILE }}")
             echo "Resuming from stage: $NEXT_STAGE"
           else
             echo "Initializing new recon for ${{ steps.resolve_target.outputs.target_domain }}"
-            python3 scripts/manage_progress.py init "${{ steps.resolve_target.outputs.target_domain }}"
-            echo "progress_state=new" >> $GITHUB_OUTPUT
+            TARGET_DOMAIN="${{ steps.resolve_target.outputs.target_domain }}"
+            jq -n \
+              --arg domain "$TARGET_DOMAIN" \
+              '{
+                target_domain: $domain,
+                last_completed_stage: "",
+                next_stage: "subdomain_enumeration",
+                current_batch: 0,
+                timestamp: (now | todate),
+                stages: {
+                  subdomain_enumeration: {status: "pending", output: "subs.txt"},
+                  dns_resolution: {status: "pending", output: "resolved.txt"},
+                  port_scanning: {status: "pending", output: "ports.txt"},
+                  http_probing: {status: "pending", output: "alive.txt"},
+                  historical_urls: {status: "pending", output: "historical_urls.txt"},
+                  live_crawling: {status: "pending", output: "crawled_urls.txt"},
+                  url_normalization: {status: "pending", output: "normalized_urls.txt"},
+                  js_analysis: {status: "pending", output: "js_files.txt"},
+                  secret_discovery: {status: "pending", output: "secrets.txt"},
+                  cloud_exposure: {status: "pending", output: "cloud_exposures.txt"},
+                  subdomain_takeover: {status: "pending", output: "takeovers.txt"},
+                  cors_testing: {status: "pending", output: "cors_findings.txt"},
+                  ssrf_discovery: {status: "pending", output: "ssrf_candidates.txt"},
+                  open_redirect: {status: "pending", output: "redirect_findings.txt"},
+                  sensitive_files: {status: "pending", output: "sensitive_files.txt"},
+                  default_creds: {status: "pending", output: "default_creds.txt"},
+                  nuclei_scanning: {status: "pending", output: "nuclei_results.txt"}
+                }
+              }' > "${{ env.PROGRESS_FILE }}"
           fi
 
       - name: Download previous artifacts
@@ -82,7 +96,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
-          cache: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -119,7 +132,6 @@ jobs:
           pip install requests jsbeautifier
           git clone --depth 1 https://github.com/m4ll0k/SecretFinder.git /opt/SecretFinder 2>/dev/null || true
           git clone --depth 1 https://github.com/s0md3v/Corsy.git /opt/Corsy 2>/dev/null || true
-          echo "Tools installed"
 
       - name: Update Nuclei templates
         run: |
@@ -131,29 +143,17 @@ jobs:
       - name: Stage 1 - Subdomain Enumeration
         id: subdomain_enumeration
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['subdomain_enumeration'].get('status')=='completed' else 1)" 2>/dev/null; then
-            echo "Stage 1 already completed, skipping"
-            exit 0
-          fi
-          python3 scripts/manage_progress.py status subdomain_enumeration running
-
+          if jq -e '.stages.subdomain_enumeration.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 1 already completed, skipping"; exit 0; fi
+          jq '.stages.subdomain_enumeration.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           TARGET="${{ steps.resolve_target.outputs.target_domain }}"
-          
-          # Passive enumeration
           subfinder -d "$TARGET" -all -o "${{ env.RESULTS_DIR }}/subfinder.txt" 2>/dev/null
           assetfinder "$TARGET" > "${{ env.RESULTS_DIR }}/assetfinder.txt" 2>/dev/null
-          
-          # Active enumeration with Amass (limited scope)
           amass enum -passive -d "$TARGET" -o "${{ env.RESULTS_DIR }}/amass.txt" 2>/dev/null || true
-          
-          # Merge and deduplicate
           cat "${{ env.RESULTS_DIR }}"/subfinder.txt "${{ env.RESULTS_DIR }}"/assetfinder.txt "${{ env.RESULTS_DIR }}"/amass.txt 2>/dev/null \
             | sort -u | grep -E "\.$TARGET$" | grep -v "^\*" > "${{ env.RESULTS_DIR }}/subs.txt"
-          
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/subs.txt" 2>/dev/null || echo 0)
           echo "Found $COUNT subdomains"
-          
-          python3 scripts/manage_progress.py complete subdomain_enumeration
+          jq '.stages.subdomain_enumeration.status = "completed" | .last_completed_stage = "subdomain_enumeration" | .next_stage = "dns_resolution" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after subdomain enumeration
         if: always()
@@ -171,26 +171,13 @@ jobs:
       - name: Stage 2 - DNS Resolution
         id: dns_resolution
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['dns_resolution'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 2 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status dns_resolution running
-
-          if [[ ! -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
-            echo "No subdomains to resolve"
-            python3 scripts/manage_progress.py complete dns_resolution
-            exit 0
-          fi
-
-          # Resolve with wildcard detection
-          dnsx -l "${{ env.RESULTS_DIR }}/subs.txt" \
-            -a -cname -mx -ptr \
-            -wildcard \
-            -o "${{ env.RESULTS_DIR }}/resolved.txt" \
-            -r 8.8.8.8,1.1.1.1,8.8.4.4 2>/dev/null
-
+          if jq -e '.stages.dns_resolution.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 2 already completed, skipping"; exit 0; fi
+          jq '.stages.dns_resolution.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
+          if [[ ! -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then echo "No subdomains to resolve"; jq '.stages.dns_resolution.status = "completed" | .last_completed_stage = "dns_resolution" | .next_stage = "port_scanning" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"; exit 0; fi
+          dnsx -l "${{ env.RESULTS_DIR }}/subs.txt" -a -cname -mx -ptr -wildcard -o "${{ env.RESULTS_DIR }}/resolved.txt" -r 8.8.8.8,1.1.1.1,8.8.4.4 2>/dev/null
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/resolved.txt" 2>/dev/null || echo 0)
           echo "Resolved $COUNT subdomains"
-
-          python3 scripts/manage_progress.py complete dns_resolution
+          jq '.stages.dns_resolution.status = "completed" | .last_completed_stage = "dns_resolution" | .next_stage = "port_scanning" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after DNS resolution
         if: always()
@@ -208,30 +195,14 @@ jobs:
       - name: Stage 3 - Port Scanning
         id: port_scanning
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['port_scanning'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 3 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status port_scanning running
-
-          if [[ ! -f "${{ env.RESULTS_DIR }}/resolved.txt" ]]; then
-            echo "No resolved hosts to scan"
-            python3 scripts/manage_progress.py complete port_scanning
-            exit 0
-          fi
-
-          # Extract just domains/hosts from resolved output
+          if jq -e '.stages.port_scanning.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 3 already completed, skipping"; exit 0; fi
+          jq '.stages.port_scanning.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
+          if [[ ! -f "${{ env.RESULTS_DIR }}/resolved.txt" ]]; then echo "No resolved hosts to scan"; jq '.stages.port_scanning.status = "completed" | .last_completed_stage = "port_scanning" | .next_stage = "http_probing" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"; exit 0; fi
           awk '{print $1}' "${{ env.RESULTS_DIR }}/resolved.txt" | sort -u > /tmp/hosts_to_scan.txt
-
-          # Rate-limited port scan using CONNECT scan (no root needed)
-          naabu -list /tmp/hosts_to_scan.txt \
-            -top-ports 100 \
-            -rate-limit 100 \
-            -c 25 \
-            -s c \
-            -o "${{ env.RESULTS_DIR }}/ports.txt" 2>/dev/null || true
-
+          naabu -list /tmp/hosts_to_scan.txt -top-ports 100 -rate-limit 100 -c 25 -s c -o "${{ env.RESULTS_DIR }}/ports.txt" 2>/dev/null || true
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/ports.txt" 2>/dev/null || echo 0)
           echo "Found $COUNT open ports"
-
-          python3 scripts/manage_progress.py complete port_scanning
+          jq '.stages.port_scanning.status = "completed" | .last_completed_stage = "port_scanning" | .next_stage = "http_probing" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after port scanning
         if: always()
@@ -249,35 +220,13 @@ jobs:
       - name: Stage 4 - HTTP Probing
         id: http_probing
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['http_probing'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 4 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status http_probing running
-
-          if [[ ! -f "${{ env.RESULTS_DIR }}/ports.txt" ]] && [[ ! -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
-            echo "No targets for HTTP probing"
-            python3 scripts/manage_progress.py complete http_probing
-            exit 0
-          fi
-
-          # Use both subdomains and port scan results
-          if [[ -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
-            TARGETS="${{ env.RESULTS_DIR }}/subs.txt"
-          else
-            echo "No targets available"
-            python3 scripts/manage_progress.py complete http_probing
-            exit 0
-          fi
-
-          httpx -l "$TARGETS" \
-            -status-code -title -tech-detect -content-length \
-            -follow-redirects -cdn -ip -cname \
-            -rl 150 \
-            -o "${{ env.RESULTS_DIR }}/alive.txt" \
-            -json 2>/dev/null || true
-
+          if jq -e '.stages.http_probing.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 4 already completed, skipping"; exit 0; fi
+          jq '.stages.http_probing.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
+          if [[ ! -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then echo "No targets for HTTP probing"; jq '.stages.http_probing.status = "completed" | .last_completed_stage = "http_probing" | .next_stage = "historical_urls" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"; exit 0; fi
+          httpx -l "${{ env.RESULTS_DIR }}/subs.txt" -status-code -title -tech-detect -content-length -follow-redirects -cdn -ip -cname -rl 150 -o "${{ env.RESULTS_DIR }}/alive.txt" -json 2>/dev/null || true
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/alive.txt" 2>/dev/null || echo 0)
           echo "Found $COUNT live HTTP services"
-
-          python3 scripts/manage_progress.py complete http_probing
+          jq '.stages.http_probing.status = "completed" | .last_completed_stage = "http_probing" | .next_stage = "historical_urls" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after HTTP probing
         if: always()
@@ -295,26 +244,15 @@ jobs:
       - name: Stage 5 - Historical URL Gathering
         id: historical_urls
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['historical_urls'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 5 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status historical_urls running
-
+          if jq -e '.stages.historical_urls.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 5 already completed, skipping"; exit 0; fi
+          jq '.stages.historical_urls.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           TARGET="${{ steps.resolve_target.outputs.target_domain }}"
-
-          # gau with multiple providers
-          echo "$TARGET" | gau --subs \
-            --o "${{ env.RESULTS_DIR }}/gau_urls.txt" 2>/dev/null || true
-
-          # waybackurls for additional coverage
+          echo "$TARGET" | gau --subs --o "${{ env.RESULTS_DIR }}/gau_urls.txt" 2>/dev/null || true
           echo "$TARGET" | waybackurls > "${{ env.RESULTS_DIR }}/wayback_urls.txt" 2>/dev/null || true
-
-          # Merge and deduplicate
-          cat "${{ env.RESULTS_DIR }}"/gau_urls.txt "${{ env.RESULTS_DIR }}"/wayback_urls.txt 2>/dev/null \
-            | sort -u > "${{ env.RESULTS_DIR }}/historical_urls.txt"
-
+          cat "${{ env.RESULTS_DIR }}"/gau_urls.txt "${{ env.RESULTS_DIR }}"/wayback_urls.txt 2>/dev/null | sort -u > "${{ env.RESULTS_DIR }}/historical_urls.txt"
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/historical_urls.txt" 2>/dev/null || echo 0)
           echo "Found $COUNT historical URLs"
-
-          python3 scripts/manage_progress.py complete historical_urls
+          jq '.stages.historical_urls.status = "completed" | .last_completed_stage = "historical_urls" | .next_stage = "live_crawling" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after historical URLs
         if: always()
@@ -332,32 +270,18 @@ jobs:
       - name: Stage 6 - Live Crawling
         id: live_crawling
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['live_crawling'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 6 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status live_crawling running
-
+          if jq -e '.stages.live_crawling.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 6 already completed, skipping"; exit 0; fi
+          jq '.stages.live_crawling.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           TARGET="${{ steps.resolve_target.outputs.target_domain }}"
-
-          # Use katana on live targets
           if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
-            # Extract URLs from httpx output (JSON)
             jq -r 'select(.url != null) | .url' "${{ env.RESULTS_DIR }}/alive.txt" > /tmp/live_urls.txt 2>/dev/null
-
             if [[ -s /tmp/live_urls.txt ]]; then
-              katana -list /tmp/live_urls.txt \
-                -d 3 \
-                -jc \
-                -kf robotstxt,sitemapxml \
-                -rl 50 \
-                -c 10 \
-                -silent \
-                -o "${{ env.RESULTS_DIR }}/crawled_urls.txt" 2>/dev/null || true
+              katana -list /tmp/live_urls.txt -d 3 -jc -kf robotstxt,sitemapxml -rl 50 -c 10 -silent -o "${{ env.RESULTS_DIR }}/crawled_urls.txt" 2>/dev/null || true
             fi
           fi
-
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/crawled_urls.txt" 2>/dev/null || echo 0)
           echo "Crawled $COUNT URLs"
-
-          python3 scripts/manage_progress.py complete live_crawling
+          jq '.stages.live_crawling.status = "completed" | .last_completed_stage = "live_crawling" | .next_stage = "url_normalization" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after crawling
         if: always()
@@ -375,29 +299,14 @@ jobs:
       - name: Stage 7 - URL Normalization
         id: url_normalization
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['url_normalization'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 7 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status url_normalization running
-
-          # Merge all URL sources
-          cat "${{ env.RESULTS_DIR }}"/historical_urls.txt "${{ env.RESULTS_DIR }}"/crawled_urls.txt 2>/dev/null \
-            | sort -u > /tmp/all_raw_urls.txt
-
-          if [[ ! -s /tmp/all_raw_urls.txt ]]; then
-            echo "No URLs to normalize"
-            python3 scripts/manage_progress.py complete url_normalization
-            exit 0
-          fi
-
-          # Normalize: deduplicate by path structure, keep unique URLs
-          cat /tmp/all_raw_urls.txt \
-            | unfurl format "%s://%d%p" \
-            | sort -u \
-            > "${{ env.RESULTS_DIR }}/normalized_urls.txt"
-
+          if jq -e '.stages.url_normalization.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 7 already completed, skipping"; exit 0; fi
+          jq '.stages.url_normalization.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
+          cat "${{ env.RESULTS_DIR }}"/historical_urls.txt "${{ env.RESULTS_DIR }}"/crawled_urls.txt 2>/dev/null | sort -u > /tmp/all_raw_urls.txt
+          if [[ ! -s /tmp/all_raw_urls.txt ]]; then echo "No URLs to normalize"; jq '.stages.url_normalization.status = "completed" | .last_completed_stage = "url_normalization" | .next_stage = "js_analysis" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"; exit 0; fi
+          cat /tmp/all_raw_urls.txt | unfurl format "%s://%d%p" | sort -u > "${{ env.RESULTS_DIR }}/normalized_urls.txt"
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/normalized_urls.txt" 2>/dev/null || echo 0)
           echo "Normalized to $COUNT unique URLs"
-
-          python3 scripts/manage_progress.py complete url_normalization
+          jq '.stages.url_normalization.status = "completed" | .last_completed_stage = "url_normalization" | .next_stage = "js_analysis" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after normalization
         if: always()
@@ -415,37 +324,23 @@ jobs:
       - name: Stage 8 - JavaScript Analysis
         id: js_analysis
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['js_analysis'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 8 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status js_analysis running
-
+          if jq -e '.stages.js_analysis.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 8 already completed, skipping"; exit 0; fi
+          jq '.stages.js_analysis.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
-            # Extract JS files using subjs
-            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
-              | subjs 2>/dev/null \
-              | sort -u > "${{ env.RESULTS_DIR }}/js_files.txt" || true
-
-            # Also find inline JS endpoints from historical/crawled URLs
-            grep -iE '\.js($|\?)' "${{ env.RESULTS_DIR }}/normalized_urls.txt" 2>/dev/null \
-              >> "${{ env.RESULTS_DIR }}/js_files.txt" || true
+            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" | subjs 2>/dev/null | sort -u > "${{ env.RESULTS_DIR }}/js_files.txt" || true
+            grep -iE '\.js($|\?)' "${{ env.RESULTS_DIR }}/normalized_urls.txt" 2>/dev/null >> "${{ env.RESULTS_DIR }}/js_files.txt" || true
             sort -u -o "${{ env.RESULTS_DIR }}/js_files.txt" "${{ env.RESULTS_DIR }}/js_files.txt"
-
-            # Extract endpoints from JS files using SecretFinder
             if [[ -s "${{ env.RESULTS_DIR }}/js_files.txt" ]]; then
-              mkdir -p /tmp/js_endpoints
               while IFS= read -r js_url; do
-                python3 /opt/SecretFinder/SecretFinder.py \
-                  -i "$js_url" \
-                  -o cli 2>/dev/null >> /tmp/js_endpoints_raw.txt || true
+                python3 /opt/SecretFinder/SecretFinder.py -i "$js_url" -o cli 2>/dev/null >> /tmp/js_endpoints_raw.txt || true
               done < "${{ env.RESULTS_DIR }}/js_files.txt"
               sort -u /tmp/js_endpoints_raw.txt > "${{ env.RESULTS_DIR }}/js_endpoints.txt" 2>/dev/null || true
             fi
           fi
-
           JS_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/js_files.txt" 2>/dev/null || echo 0)
           EP_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/js_endpoints.txt" 2>/dev/null || echo 0)
           echo "Found $JS_COUNT JS files, $EP_COUNT endpoints"
-
-          python3 scripts/manage_progress.py complete js_analysis
+          jq '.stages.js_analysis.status = "completed" | .last_completed_stage = "js_analysis" | .next_stage = "secret_discovery" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after JS analysis
         if: always()
@@ -464,36 +359,25 @@ jobs:
       - name: Stage 9 - Secret Discovery
         id: secret_discovery
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['secret_discovery'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 9 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status secret_discovery running
-
-          # Scan JS files with trufflehog
+          if jq -e '.stages.secret_discovery.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 9 already completed, skipping"; exit 0; fi
+          jq '.stages.secret_discovery.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -s "${{ env.RESULTS_DIR }}/js_files.txt" ]]; then
             while IFS= read -r js_url; do
               curl -sL "$js_url" 2>/dev/null >> /tmp/js_content.txt || true
             done < "${{ env.RESULTS_DIR }}/js_files.txt"
-
             if [[ -s /tmp/js_content.txt ]]; then
-              trufflehog filesystem /tmp/js_content.txt \
-                --json 2>/dev/null > "${{ env.RESULTS_DIR }}/secrets.json" || true
+              trufflehog filesystem /tmp/js_content.txt --json 2>/dev/null > "${{ env.RESULTS_DIR }}/secrets.json" || true
             fi
           fi
-
-          # Also scan normalized URLs for secret patterns
           if [[ -s "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
-            trufflehog filesystem "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
-              --json 2>/dev/null >> "${{ env.RESULTS_DIR }}/secrets.json" || true
+            trufflehog filesystem "${{ env.RESULTS_DIR }}/normalized_urls.txt" --json 2>/dev/null >> "${{ env.RESULTS_DIR }}/secrets.json" || true
           fi
-
-          # Convert to readable format
           if [[ -f "${{ env.RESULTS_DIR }}/secrets.json" ]]; then
             jq -r '{source: (.SourceMetadata.Data.Filesystem.file // ""), detector: .DetectorName, raw: (.Raw[0:100] // "")} | "Source: \(.source) | Detector: \(.detector) | Raw: \(.raw)"' "${{ env.RESULTS_DIR }}/secrets.json" 2>/dev/null > "${{ env.RESULTS_DIR }}/secrets.txt" || true
           fi
-
           SECRET_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/secrets.txt" 2>/dev/null || echo 0)
           echo "Found $SECRET_COUNT potential secrets"
-
-          python3 scripts/manage_progress.py complete secret_discovery
+          jq '.stages.secret_discovery.status = "completed" | .last_completed_stage = "secret_discovery" | .next_stage = "cloud_exposure" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after secret discovery
         if: always()
@@ -512,26 +396,18 @@ jobs:
       - name: Stage 10 - Cloud Storage Exposure Detection
         id: cloud_exposure
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['cloud_exposure'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 10 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status cloud_exposure running
-
+          if jq -e '.stages.cloud_exposure.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 10 already completed, skipping"; exit 0; fi
+          jq '.stages.cloud_exposure.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           TARGET="${{ steps.resolve_target.outputs.target_domain }}"
           ORG=$(echo "$TARGET" | cut -d. -f1)
-
-          # Scan for open S3 buckets using permutations
-          echo "$ORG" | s3scanner -o "${{ env.RESULTS_DIR }}/cloud_exposures.txt" 2>/dev/null || true
-
-          # Also bucket permutations with common prefixes
-          for prefix in "" "dev-" "prod-" "stage-" "test-" "backup-" "data-" "assets-" "media-" "uploads-"; do
-            echo "${prefix}${ORG}" | s3scanner -o "${{ env.RESULTS_DIR }}/cloud_exposures.txt" 2>/dev/null || true
-          done
-
+           echo "$ORG" | s3scanner -o "${{ env.RESULTS_DIR }}/cloud_exposures.txt" 2>/dev/null || true
+           for prefix in "dev-" "prod-" "stage-" "test-" "backup-" "data-" "assets-" "media-" "uploads-"; do
+             echo "${prefix}${ORG}" | s3scanner >> "${{ env.RESULTS_DIR }}/cloud_exposures.txt" 2>/dev/null || true
+           done
           sort -u -o "${{ env.RESULTS_DIR }}/cloud_exposures.txt" "${{ env.RESULTS_DIR }}/cloud_exposures.txt" 2>/dev/null || true
-
           CLOUD_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/cloud_exposures.txt" 2>/dev/null || echo 0)
           echo "Found $CLOUD_COUNT potential cloud exposures"
-
-          python3 scripts/manage_progress.py complete cloud_exposure
+          jq '.stages.cloud_exposure.status = "completed" | .last_completed_stage = "cloud_exposure" | .next_stage = "subdomain_takeover" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after cloud exposure
         if: always()
@@ -549,29 +425,15 @@ jobs:
       - name: Stage 11 - Subdomain Takeover Detection
         id: subdomain_takeover
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['subdomain_takeover'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 11 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status subdomain_takeover running
-
+          if jq -e '.stages.subdomain_takeover.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 11 already completed, skipping"; exit 0; fi
+          jq '.stages.subdomain_takeover.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
-            subjack -w "${{ env.RESULTS_DIR }}/subs.txt" \
-              -t 50 \
-              -timeout 15 \
-              -ssl \
-              -o "${{ env.RESULTS_DIR }}/takeovers.txt" 2>/dev/null || true
-
-            # Also run nuclei takeover templates for additional coverage
-            cat "${{ env.RESULTS_DIR }}/subs.txt" \
-              | nuclei -t ~/nuclei-templates/takeovers/ \
-                -rl 100 \
-                -c 25 \
-                -silent \
-                -json 2>/dev/null >> "${{ env.RESULTS_DIR }}/nuclei_takeovers.json" || true
+            subjack -w "${{ env.RESULTS_DIR }}/subs.txt" -t 50 -timeout 15 -ssl -o "${{ env.RESULTS_DIR }}/takeovers.txt" 2>/dev/null || true
+            cat "${{ env.RESULTS_DIR }}/subs.txt" | nuclei -t ~/nuclei-templates/takeovers/ -rl 100 -c 25 -silent -json 2>/dev/null >> "${{ env.RESULTS_DIR }}/nuclei_takeovers.json" || true
           fi
-
           TAKEOVER_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/takeovers.txt" 2>/dev/null || echo 0)
           echo "Found $TAKEOVER_COUNT potential takeovers"
-
-          python3 scripts/manage_progress.py complete subdomain_takeover
+          jq '.stages.subdomain_takeover.status = "completed" | .last_completed_stage = "subdomain_takeover" | .next_stage = "cors_testing" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after takeover detection
         if: always()
@@ -589,24 +451,17 @@ jobs:
       - name: Stage 12 - CORS Misconfiguration Detection
         id: cors_testing
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['cors_testing'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 12 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status cors_testing running
-
+          if jq -e '.stages.cors_testing.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 12 already completed, skipping"; exit 0; fi
+          jq '.stages.cors_testing.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
             jq -r 'select(.url != null) | .url' "${{ env.RESULTS_DIR }}/alive.txt" > /tmp/cors_targets.txt 2>/dev/null
-
             if [[ -s /tmp/cors_targets.txt ]]; then
-              python3 /opt/Corsy/corsy.py \
-                -i /tmp/cors_targets.txt \
-                -t 20 \
-                -o "${{ env.RESULTS_DIR }}/cors_findings.json" 2>/dev/null || true
+              python3 /opt/Corsy/corsy.py -i /tmp/cors_targets.txt -t 20 -o "${{ env.RESULTS_DIR }}/cors_findings.json" 2>/dev/null || true
             fi
           fi
-
-          CORS_COUNT=$(python3 -c "import json; data=json.load(open('${{ env.RESULTS_DIR }}/cors_findings.json')); print(len(data))" 2>/dev/null || echo 0)
+          CORS_COUNT=$(jq 'length' "${{ env.RESULTS_DIR }}/cors_findings.json" 2>/dev/null || echo 0)
           echo "Found $CORS_COUNT CORS misconfigurations"
-
-          python3 scripts/manage_progress.py complete cors_testing
+          jq '.stages.cors_testing.status = "completed" | .last_completed_stage = "cors_testing" | .next_stage = "ssrf_discovery" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after CORS testing
         if: always()
@@ -624,23 +479,14 @@ jobs:
       - name: Stage 13 - SSRF Endpoint Discovery
         id: ssrf_discovery
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['ssrf_discovery'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 13 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status ssrf_discovery running
-
-          # Identify endpoints with parameters that commonly accept URLs
+          if jq -e '.stages.ssrf_discovery.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 13 already completed, skipping"; exit 0; fi
+          jq '.stages.ssrf_discovery.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
-            # Find URL parameters that could be SSRF-prone
-            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
-              | unfurl keypairs \
-              | grep -iE '(url|uri|path|dest|redirect|return|next|file|load|read|document|site|html|image|img|src|link|out|view|path|page|feed|location|port|host|domain|callback|continue|target|endpoint|api|proxy)' \
-              | sort -u \
-              > "${{ env.RESULTS_DIR }}/ssrf_candidates.txt" 2>/dev/null || true
+            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" | unfurl keypairs | grep -iE '(url|uri|path|dest|redirect|return|next|file|load|read|document|site|html|image|img|src|link|out|view|path|page|feed|location|port|host|domain|callback|continue|target|endpoint|api|proxy)' | sort -u > "${{ env.RESULTS_DIR }}/ssrf_candidates.txt" 2>/dev/null || true
           fi
-
           SSR_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/ssrf_candidates.txt" 2>/dev/null || echo 0)
           echo "Found $SSR_COUNT SSRF candidate parameters"
-
-          python3 scripts/manage_progress.py complete ssrf_discovery
+          jq '.stages.ssrf_discovery.status = "completed" | .last_completed_stage = "ssrf_discovery" | .next_stage = "open_redirect" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after SSRF discovery
         if: always()
@@ -658,33 +504,17 @@ jobs:
       - name: Stage 14 - Open Redirect Discovery
         id: open_redirect
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['open_redirect'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 14 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status open_redirect running
-
-          # Identify potentially open redirect parameters
+          if jq -e '.stages.open_redirect.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 14 already completed, skipping"; exit 0; fi
+          jq '.stages.open_redirect.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
-            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
-              | unfurl keypairs \
-              | grep -iE '(redirect|return|next|url|link|to|out|target|callback|continue|dest|destination|ref|referer|referrer|url=|uri=|path=)' \
-              | sort -u \
-              > "${{ env.RESULTS_DIR }}/redirect_candidates.txt" 2>/dev/null || true
+            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" | unfurl keypairs | grep -iE '(redirect|return|next|url|link|to|out|target|callback|continue|dest|destination|ref|referer|referrer|url=|uri=|path=)' | sort -u > "${{ env.RESULTS_DIR }}/redirect_candidates.txt" 2>/dev/null || true
           fi
-
-          # Use nuclei open-redirect templates for validation
           if [[ -s "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
-            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
-              | nuclei -t ~/nuclei-templates/http/exposures/ \
-                -tags redirect \
-                -rl 100 \
-                -c 20 \
-                -silent \
-                -json 2>/dev/null > "${{ env.RESULTS_DIR }}/redirect_nuclei.json" || true
+            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" | nuclei -t ~/nuclei-templates/http/exposures/ -tags redirect -rl 100 -c 20 -silent -json 2>/dev/null > "${{ env.RESULTS_DIR }}/redirect_nuclei.json" || true
           fi
-
           REDIR_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/redirect_candidates.txt" 2>/dev/null || echo 0)
           echo "Found $REDIR_COUNT open redirect candidates"
-
-          python3 scripts/manage_progress.py complete open_redirect
+          jq '.stages.open_redirect.status = "completed" | .last_completed_stage = "open_redirect" | .next_stage = "sensitive_files" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after open redirect
         if: always()
@@ -693,7 +523,6 @@ jobs:
           name: recon-results-redirect
           path: |
             ${{ env.RESULTS_DIR }}/redirect_candidates.txt
-            ${{ env.RESULTS_DIR }}/redirect_findings.txt
             ${{ env.PROGRESS_FILE }}
           if-no-files-found: warn
 
@@ -703,29 +532,17 @@ jobs:
       - name: Stage 15 - Sensitive File Detection
         id: sensitive_files
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['sensitive_files'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 15 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status sensitive_files running
-
-          # Nuclei templates for sensitive file exposure
+          if jq -e '.stages.sensitive_files.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 15 already completed, skipping"; exit 0; fi
+          jq '.stages.sensitive_files.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
             jq -r 'select(.url != null) | .url' "${{ env.RESULTS_DIR }}/alive.txt" > /tmp/sensitive_targets.txt 2>/dev/null
-
             if [[ -s /tmp/sensitive_targets.txt ]]; then
-              nuclei -l /tmp/sensitive_targets.txt \
-                -t ~/nuclei-templates/http/exposures/ \
-                -tags config,backup,env \
-                -severity high,critical \
-                -rl 100 \
-                -c 20 \
-                -json \
-                -o "${{ env.RESULTS_DIR }}/sensitive_files.json" 2>/dev/null || true
+              nuclei -l /tmp/sensitive_targets.txt -t ~/nuclei-templates/http/exposures/ -tags config,backup,env -severity high,critical -rl 100 -c 20 -json -o "${{ env.RESULTS_DIR }}/sensitive_files.json" 2>/dev/null || true
             fi
           fi
-
           SNSTV_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/sensitive_files.json" 2>/dev/null || echo 0)
           echo "Found $SNSTV_COUNT potential sensitive file exposures"
-
-          python3 scripts/manage_progress.py complete sensitive_files
+          jq '.stages.sensitive_files.status = "completed" | .last_completed_stage = "sensitive_files" | .next_stage = "default_creds" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after sensitive files
         if: always()
@@ -743,37 +560,18 @@ jobs:
       - name: Stage 16 - Default Credential Detection
         id: default_creds
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['default_creds'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 16 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status default_creds running
-
+          if jq -e '.stages.default_creds.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 16 already completed, skipping"; exit 0; fi
+          jq '.stages.default_creds.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
             jq -r 'select(.url != null) | .url' "${{ env.RESULTS_DIR }}/alive.txt" > /tmp/cred_targets.txt 2>/dev/null
-
             if [[ -s /tmp/cred_targets.txt ]]; then
-              # Nuclei templates for default credentials and exposed panels
-              nuclei -l /tmp/cred_targets.txt \
-                -t ~/nuclei-templates/http/default-logins/ \
-                -severity high,critical \
-                -rl 100 \
-                -c 20 \
-                -json \
-                -o "${{ env.RESULTS_DIR }}/default_creds.json" 2>/dev/null || true
-
-              # Also check for exposed admin panels
-              nuclei -l /tmp/cred_targets.txt \
-                -t ~/nuclei-templates/http/exposed-panels/ \
-                -severity high,critical \
-                -rl 100 \
-                -c 20 \
-                -json \
-                -o "${{ env.RESULTS_DIR }}/admin_panels.json" 2>/dev/null || true
+              nuclei -l /tmp/cred_targets.txt -t ~/nuclei-templates/http/default-logins/ -severity high,critical -rl 100 -c 20 -json -o "${{ env.RESULTS_DIR }}/default_creds.json" 2>/dev/null || true
+              nuclei -l /tmp/cred_targets.txt -t ~/nuclei-templates/http/exposed-panels/ -severity high,critical -rl 100 -c 20 -json -o "${{ env.RESULTS_DIR }}/admin_panels.json" 2>/dev/null || true
             fi
           fi
-
           CRED_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/default_creds.json" 2>/dev/null || echo 0)
           echo "Found $CRED_COUNT potential default credentials"
-
-          python3 scripts/manage_progress.py complete default_creds
+          jq '.stages.default_creds.status = "completed" | .last_completed_stage = "default_creds" | .next_stage = "nuclei_scanning" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
 
       - name: Upload artifacts after default creds
         if: always()
@@ -792,85 +590,46 @@ jobs:
       - name: Stage 17 - High-Confidence Nuclei Scanning
         id: nuclei_scanning
         run: |
-          if python3 -c "import json; d=json.load(open('${{ env.PROGRESS_FILE }}')); exit(0 if d['stages']['nuclei_scanning'].get('status')=='completed' else 1)" 2>/dev/null; then echo "Stage 17 already completed, skipping"; exit 0; fi
-          python3 scripts/manage_progress.py status nuclei_scanning running
-
-          # Prepare targets from normalized URLs
+          if jq -e '.stages.nuclei_scanning.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 17 already completed, skipping"; exit 0; fi
+          jq '.stages.nuclei_scanning.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ ! -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]] || [[ ! -s "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
             echo "No URLs for nuclei scanning"
-            python3 scripts/manage_progress.py complete nuclei_scanning
+            jq '.stages.nuclei_scanning.status = "completed" | .last_completed_stage = "nuclei_scanning" | .next_stage = "complete" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
             exit 0
           fi
-
-          # Read progress to get current batch
-          PROGRESS=$(python3 scripts/manage_progress.py read 2>/dev/null)
-          CURRENT_BATCH=$(echo "$PROGRESS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('current_batch', 0))" 2>/dev/null || echo 0)
+          CURRENT_BATCH=$(jq -r '.current_batch // 0' "${{ env.PROGRESS_FILE }}")
           BATCH_SIZE=5000
           TOTAL_URLS=$(wc -l < "${{ env.RESULTS_DIR }}/normalized_urls.txt")
           TOTAL_BATCHES=$(( (TOTAL_URLS + BATCH_SIZE - 1) / BATCH_SIZE ))
-
           echo "Total URLs: $TOTAL_URLS, Total batches: $TOTAL_BATCHES, Starting from batch: $CURRENT_BATCH"
-
-          # Scan with targeted high-confidence templates only
           HIGH_CONFIDENCE_TAGS="cve,exposure,config,default-login,panel,misconfig"
-          
           for ((batch=CURRENT_BATCH; batch<TOTAL_BATCHES; batch++)); do
             START=$((batch * BATCH_SIZE))
             echo "Processing batch $((batch+1))/$TOTAL_BATCHES (URLs $START-$((START+BATCH_SIZE-1)))"
-
-            sed -n "$((START+1)),$((START+BATCH_SIZE))p" "${{ env.RESULTS_DIR }}/normalized_urls.txt" \
-              > /tmp/nuclei_batch.txt
-
-            if [[ ! -s /tmp/nuclei_batch.txt ]]; then
-              continue
-            fi
-
-            nuclei -l /tmp/nuclei_batch.txt \
-              -severity high,critical \
-              -tags $HIGH_CONFIDENCE_TAGS \
-              -rl 150 \
-              -bs 25 \
-              -c 25 \
-              -timeout 10 \
-              -retries 1 \
-              -json \
-              -o /tmp/nuclei_batch_output.json 2>/dev/null || true
-
-            # Append to results
+            sed -n "$((START+1)),$((START+BATCH_SIZE))p" "${{ env.RESULTS_DIR }}/normalized_urls.txt" > /tmp/nuclei_batch.txt
+            if [[ ! -s /tmp/nuclei_batch.txt ]]; then continue; fi
+            nuclei -l /tmp/nuclei_batch.txt -severity high,critical -tags $HIGH_CONFIDENCE_TAGS -rl 150 -bs 25 -c 25 -timeout 10 -retries 1 -json -o /tmp/nuclei_batch_output.json 2>/dev/null || true
             cat /tmp/nuclei_batch_output.json >> "${{ env.RESULTS_DIR }}/nuclei_results.json" 2>/dev/null || true
-
-            # Update batch progress
-            python3 scripts/manage_progress.py batch $((batch + 1))
-            python3 scripts/manage_progress.py status nuclei_scanning "running (batch $((batch+1))/$TOTAL_BATCHES)"
-
-            # Upload intermediate results every 5 batches
+            jq --arg b "$((batch + 1))" '.current_batch = ($b | tonumber) | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
             if [[ $((batch % 5)) -eq 0 ]] || [[ $batch -eq $((TOTAL_BATCHES - 1)) ]]; then
-              # Upload checkpoint artifacts for resume
               cp "${{ env.RESULTS_DIR }}/nuclei_results.json" /tmp/nuclei_checkpoint.json 2>/dev/null || true
-              echo "Checkpoint uploaded at batch $((batch+1))"
+              echo "Checkpoint at batch $((batch+1))"
             fi
-
-            # Check if we're approaching the workflow timeout
-            # If so, trigger auto-resume
-            ELAPSED_MINUTES=$((SECONDS / 60))
-            if [[ $ELAPSED_MINUTES -gt ${{ env.WORKFLOW_TIMEOUT_MINUTES }} ]]; then
-              echo "Approaching timeout. Triggering auto-resume."
-              
-              # Trigger repository_dispatch for continuation
-              curl -s -X POST \
-                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                https://api.github.com/repos/${{ github.repository }}/dispatches \
-                -d "{\"event_type\":\"resume_recon\",\"client_payload\":{\"target_domain\":\"${{ steps.resolve_target.outputs.target_domain }}\"}}" \
-                || true
-              
-              echo "Auto-resume triggered. Current run will complete current batch gracefully."
-              break
-            fi
-          done
-
-          # Final upload after all batches
-          python3 scripts/manage_progress.py complete nuclei_scanning
+              ELAPSED_MINUTES=$((SECONDS / 60))
+             if [[ $ELAPSED_MINUTES -gt ${{ env.WORKFLOW_TIMEOUT_MINUTES }} ]]; then
+               echo "Approaching timeout. Triggering auto-resume (keeping stage as in_progress)."
+               jq '.stages.nuclei_scanning.status = "in_progress" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
+               curl -s -X POST -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/dispatches -d "{\"event_type\":\"resume_recon\",\"client_payload\":{\"target_domain\":\"${{ steps.resolve_target.outputs.target_domain }}\"}}" || true
+               echo "Auto-resume triggered."
+               break
+             fi
+           done
+           CURRENT_STATUS=$(jq -r '.stages.nuclei_scanning.status' "${{ env.PROGRESS_FILE }}")
+           if [[ "$CURRENT_STATUS" != "in_progress" ]]; then
+             jq '.stages.nuclei_scanning.status = "completed" | .last_completed_stage = "nuclei_scanning" | .next_stage = "complete" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
+           else
+             echo "Stage not completed - auto-resume will continue on next run"
+           fi
 
       - name: Upload artifacts after nuclei scanning
         if: always()
@@ -892,21 +651,15 @@ jobs:
           echo "Target: ${{ steps.resolve_target.outputs.target_domain }}" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
           echo "Timestamp: $(date -u)" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
           echo "" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
-
-          for file in subs.txt resolved.txt ports.txt alive.txt historical_urls.txt crawled_urls.txt \
-                       normalized_urls.txt js_files.txt secrets.txt cloud_exposures.txt \
-                       takeovers.txt cors_findings.json ssrf_candidates.txt redirect_candidates.txt \
-                       sensitive_files.json default_creds.json nuclei_results.json; do
-            if [[ -f "${{ env.RESULTS_DIR }}/$file" ]]; then
-              COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/$file" 2>/dev/null || echo 0)
-              echo "$file: $COUNT results" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
-            else
-              echo "$file: NOT FOUND" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+          echo "=== Stage Results ===" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+          jq -r '.stages | to_entries[] | "\(.key): \(.value.status) (\(.value.output // "N/A"))"' "${{ env.PROGRESS_FILE }}" 2>/dev/null >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt || true
+          echo "" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+          echo "=== File Counts ===" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
+          for f in "${{ env.RESULTS_DIR }}"/*.txt "${{ env.RESULTS_DIR }}"/*.json; do
+            if [[ -f "$f" ]]; then
+              echo "$(basename "$f"): $(wc -l < "$f" 2>/dev/null || echo 0) lines" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
             fi
           done
-
-          echo "" >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
-          python3 scripts/manage_progress.py summary >> ${{ env.RESULTS_DIR }}/FINAL_SUMMARY.txt
 
       - name: Upload final consolidated results
         if: always()
