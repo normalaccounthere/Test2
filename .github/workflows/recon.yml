@@ -307,7 +307,7 @@ jobs:
           jq '.stages.url_normalization.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
            cat "${{ env.RESULTS_DIR }}"/historical_urls.txt "${{ env.RESULTS_DIR }}"/crawled_urls.txt 2>/dev/null | sort -u > /tmp/all_raw_urls.txt || true
            if [[ ! -s /tmp/all_raw_urls.txt ]]; then echo "No URLs to normalize"; jq '.stages.url_normalization.status = "completed" | .last_completed_stage = "url_normalization" | .next_stage = "js_analysis" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"; exit 0; fi
-           cat /tmp/all_raw_urls.txt | unfurl format "%s://%d%p" | sort -u > "${{ env.RESULTS_DIR }}/normalized_urls.txt" || true
+           python3 -c "import sys; [print(u.split('?')[0].split('#')[0]) for u in sys.stdin if u.strip()]" < /tmp/all_raw_urls.txt | sort -u > "${{ env.RESULTS_DIR }}/normalized_urls.txt" || true
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/normalized_urls.txt" 2>/dev/null || echo 0)
           echo "Normalized to $COUNT unique URLs"
           jq '.stages.url_normalization.status = "completed" | .last_completed_stage = "url_normalization" | .next_stage = "js_analysis" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
@@ -490,7 +490,7 @@ jobs:
           if jq -e '.stages.ssrf_discovery.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 13 already completed, skipping"; exit 0; fi
           jq '.stages.ssrf_discovery.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
-            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" | unfurl keypairs | grep -iE '(url|uri|path|dest|redirect|return|next|file|load|read|document|site|html|image|img|src|link|out|view|path|page|feed|location|port|host|domain|callback|continue|target|endpoint|api|proxy)' | sort -u > "${{ env.RESULTS_DIR }}/ssrf_candidates.txt" 2>/dev/null || true
+            python3 -c "import sys, urllib.parse; [print(k) for u in sys.stdin if u.strip() for k, v in urllib.parse.parse_qsl(urllib.parse.urlparse(u.strip()).query)]" < "${{ env.RESULTS_DIR }}/normalized_urls.txt" | grep -iE '(url|uri|path|dest|redirect|return|next|file|load|read|document|site|html|image|img|src|link|out|view|path|page|feed|location|port|host|domain|callback|continue|target|endpoint|api|proxy)' | sort -u > "${{ env.RESULTS_DIR }}/ssrf_candidates.txt" 2>/dev/null || true
           fi
           SSR_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/ssrf_candidates.txt" 2>/dev/null || echo 0)
           echo "Found $SSR_COUNT SSRF candidate parameters"
@@ -515,7 +515,7 @@ jobs:
           if jq -e '.stages.open_redirect.status == "completed"' "${{ env.PROGRESS_FILE }}" > /dev/null 2>&1; then echo "Stage 14 already completed, skipping"; exit 0; fi
           jq '.stages.open_redirect.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
-            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" | unfurl keypairs | grep -iE '(redirect|return|next|url|link|to|out|target|callback|continue|dest|destination|ref|referer|referrer|url=|uri=|path=)' | sort -u > "${{ env.RESULTS_DIR }}/redirect_candidates.txt" 2>/dev/null || true
+            python3 -c "import sys, urllib.parse; [print(k) for u in sys.stdin if u.strip() for k, v in urllib.parse.parse_qsl(urllib.parse.urlparse(u.strip()).query)]" < "${{ env.RESULTS_DIR }}/normalized_urls.txt" | grep -iE '(redirect|return|next|url|link|to|out|target|callback|continue|dest|destination|ref|referer|referrer|url=|uri=|path=)' | sort -u > "${{ env.RESULTS_DIR }}/redirect_candidates.txt" 2>/dev/null || true
           fi
            if [[ -s "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
             nuclei -l "${{ env.RESULTS_DIR }}/normalized_urls.txt" -tags redirect -rl 100 -c 20 -silent -json -o /tmp/rn.json 2>/dev/null || true
