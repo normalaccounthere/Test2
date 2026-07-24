@@ -75,12 +75,12 @@ jobs:
                   secret_discovery: {status: "pending", output: "secrets.txt"},
                   cloud_exposure: {status: "pending", output: "cloud_exposures.txt"},
                   subdomain_takeover: {status: "pending", output: "takeovers.txt"},
-                  cors_testing: {status: "pending", output: "cors_findings.txt"},
+                   cors_testing: {status: "pending", output: "cors_findings.json"},
                   ssrf_discovery: {status: "pending", output: "ssrf_candidates.txt"},
                   open_redirect: {status: "pending", output: "redirect_findings.txt"},
-                  sensitive_files: {status: "pending", output: "sensitive_files.txt"},
-                  default_creds: {status: "pending", output: "default_creds.txt"},
-                  nuclei_scanning: {status: "pending", output: "nuclei_results.txt"}
+                   sensitive_files: {status: "pending", output: "sensitive_files.json"},
+                   default_creds: {status: "pending", output: "default_creds.json"},
+                   nuclei_scanning: {status: "pending", output: "nuclei_results.json"}
                 }
               }' > "${{ env.PROGRESS_FILE }}"
           fi
@@ -129,7 +129,7 @@ jobs:
 
       - name: Install Python tools
         run: |
-          pip install requests jsbeautifier
+          pip install requests jsbeautifier beautifulsoup4
           git clone --depth 1 https://github.com/m4ll0k/SecretFinder.git /opt/SecretFinder 2>/dev/null || true
           git clone --depth 1 https://github.com/s0md3v/Corsy.git /opt/Corsy 2>/dev/null || true
 
@@ -199,7 +199,7 @@ jobs:
           jq '.stages.port_scanning.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ ! -f "${{ env.RESULTS_DIR }}/resolved.txt" ]]; then echo "No resolved hosts to scan"; jq '.stages.port_scanning.status = "completed" | .last_completed_stage = "port_scanning" | .next_stage = "http_probing" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"; exit 0; fi
           awk '{print $1}' "${{ env.RESULTS_DIR }}/resolved.txt" | sort -u > /tmp/hosts_to_scan.txt
-          naabu -list /tmp/hosts_to_scan.txt -top-ports 100 -rate-limit 100 -c 25 -s c -o "${{ env.RESULTS_DIR }}/ports.txt" 2>/dev/null || true
+           naabu -list /tmp/hosts_to_scan.txt -top-ports 100 -rate-limit 100 -c 25 -s n -o "${{ env.RESULTS_DIR }}/ports.txt" 2>/dev/null || true
           COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/ports.txt" 2>/dev/null || echo 0)
           echo "Found $COUNT open ports"
           jq '.stages.port_scanning.status = "completed" | .last_completed_stage = "port_scanning" | .next_stage = "http_probing" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
@@ -429,7 +429,8 @@ jobs:
           jq '.stages.subdomain_takeover.status = "running" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
           if [[ -f "${{ env.RESULTS_DIR }}/subs.txt" ]]; then
             subjack -w "${{ env.RESULTS_DIR }}/subs.txt" -t 50 -timeout 15 -ssl -o "${{ env.RESULTS_DIR }}/takeovers.txt" 2>/dev/null || true
-            cat "${{ env.RESULTS_DIR }}/subs.txt" | nuclei -t ~/nuclei-templates/takeovers/ -rl 100 -c 25 -silent -json 2>/dev/null >> "${{ env.RESULTS_DIR }}/nuclei_takeovers.json" || true
+            nuclei -l "${{ env.RESULTS_DIR }}/subs.txt" -t takeovers/ -rl 100 -c 25 -silent -json -o /tmp/nt.json 2>/dev/null || true
+            if [[ -f /tmp/nt.json ]]; then cat /tmp/nt.json >> "${{ env.RESULTS_DIR }}/nuclei_takeovers.json"; fi
           fi
           TAKEOVER_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/takeovers.txt" 2>/dev/null || echo 0)
           echo "Found $TAKEOVER_COUNT potential takeovers"
@@ -509,9 +510,10 @@ jobs:
           if [[ -f "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
             cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" | unfurl keypairs | grep -iE '(redirect|return|next|url|link|to|out|target|callback|continue|dest|destination|ref|referer|referrer|url=|uri=|path=)' | sort -u > "${{ env.RESULTS_DIR }}/redirect_candidates.txt" 2>/dev/null || true
           fi
-          if [[ -s "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
-            cat "${{ env.RESULTS_DIR }}/normalized_urls.txt" | nuclei -t ~/nuclei-templates/http/exposures/ -tags redirect -rl 100 -c 20 -silent -json 2>/dev/null > "${{ env.RESULTS_DIR }}/redirect_nuclei.json" || true
-          fi
+           if [[ -s "${{ env.RESULTS_DIR }}/normalized_urls.txt" ]]; then
+            nuclei -l "${{ env.RESULTS_DIR }}/normalized_urls.txt" -t http/exposures/ -tags redirect -rl 100 -c 20 -silent -json -o /tmp/rn.json 2>/dev/null || true
+            if [[ -f /tmp/rn.json ]]; then cat /tmp/rn.json > "${{ env.RESULTS_DIR }}/redirect_nuclei.json"; fi
+           fi
           REDIR_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/redirect_candidates.txt" 2>/dev/null || echo 0)
           echo "Found $REDIR_COUNT open redirect candidates"
           jq '.stages.open_redirect.status = "completed" | .last_completed_stage = "open_redirect" | .next_stage = "sensitive_files" | .timestamp = (now | todate)' "${{ env.PROGRESS_FILE }}" > /tmp/p.json && mv /tmp/p.json "${{ env.PROGRESS_FILE }}"
@@ -537,7 +539,7 @@ jobs:
           if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
             jq -r 'select(.url != null) | .url' "${{ env.RESULTS_DIR }}/alive.txt" > /tmp/sensitive_targets.txt 2>/dev/null
             if [[ -s /tmp/sensitive_targets.txt ]]; then
-              nuclei -l /tmp/sensitive_targets.txt -t ~/nuclei-templates/http/exposures/ -tags config,backup,env -severity high,critical -rl 100 -c 20 -json -o "${{ env.RESULTS_DIR }}/sensitive_files.json" 2>/dev/null || true
+              nuclei -l /tmp/sensitive_targets.txt -t http/exposures/ -tags config,backup,env -severity high,critical -rl 100 -c 20 -json -o "${{ env.RESULTS_DIR }}/sensitive_files.json" 2>/dev/null || true
             fi
           fi
           SNSTV_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/sensitive_files.json" 2>/dev/null || echo 0)
@@ -565,8 +567,8 @@ jobs:
           if [[ -f "${{ env.RESULTS_DIR }}/alive.txt" ]]; then
             jq -r 'select(.url != null) | .url' "${{ env.RESULTS_DIR }}/alive.txt" > /tmp/cred_targets.txt 2>/dev/null
             if [[ -s /tmp/cred_targets.txt ]]; then
-              nuclei -l /tmp/cred_targets.txt -t ~/nuclei-templates/http/default-logins/ -severity high,critical -rl 100 -c 20 -json -o "${{ env.RESULTS_DIR }}/default_creds.json" 2>/dev/null || true
-              nuclei -l /tmp/cred_targets.txt -t ~/nuclei-templates/http/exposed-panels/ -severity high,critical -rl 100 -c 20 -json -o "${{ env.RESULTS_DIR }}/admin_panels.json" 2>/dev/null || true
+              nuclei -l /tmp/cred_targets.txt -t http/default-logins/ -severity high,critical -rl 100 -c 20 -json -o "${{ env.RESULTS_DIR }}/default_creds.json" 2>/dev/null || true
+              nuclei -l /tmp/cred_targets.txt -t http/exposed-panels/ -severity high,critical -rl 100 -c 20 -json -o "${{ env.RESULTS_DIR }}/admin_panels.json" 2>/dev/null || true
             fi
           fi
           CRED_COUNT=$(wc -l < "${{ env.RESULTS_DIR }}/default_creds.json" 2>/dev/null || echo 0)
